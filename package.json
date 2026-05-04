@@ -1,0 +1,51 @@
+{
+  "name": "@backloghq/termlog",
+  "version": "0.0.1",
+  "description": "Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "full-text-search",
+    "fts",
+    "inverted-index",
+    "bm25",
+    "lsm",
+    "embedded",
+    "search-engine"
+  ],
+  "author": "mbocevski",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@types/node": "^25.0.0",
+    "@vitest/coverage-v8": "^4.1.2",
+    "eslint": "^10.0.0",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.58.1",
+    "vitest": "^4.1.2"
+  }
+}
