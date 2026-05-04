@@ -306,6 +306,68 @@ describe("manifest-before-reader-open invariant", () => {
     const { docIds } = newSeg.decodePostings("b");
     expect(docIds).toContain(1);
   });
+
+  it("tieredCompactLocked: writeManifest failure leaves all in-memory state unchanged", async () => {
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 4 });
+    for (let i = 0; i < 3; i++) {
+      await mgr.add(i, [{ term: `t${i}`, tf: 1 }]);
+    }
+
+    const preTotalDocs = mgr.indexTotalDocs;
+    const preTotalLen = mgr.indexTotalLen;
+    const preGen = mgr.commitGeneration();
+    const preSegs = mgr.segments().length;
+
+    // Allow the flush manifest write (#1) to succeed; fail the cascade's manifest write (#2).
+    let manifestWrites = 0;
+    const realWrite = backend.writeBlob.bind(backend);
+    backend.writeBlob = async (path: string, data: Buffer) => {
+      if (path === "manifest.json") {
+        manifestWrites++;
+        if (manifestWrites === 2) throw new Error("simulated cascade manifest write failure");
+      }
+      return realWrite(path, data);
+    };
+
+    await expect(mgr.add(3, [{ term: "t3", tf: 1 }])).rejects.toThrow("simulated cascade manifest write failure");
+
+    // Flush committed (gen+1, 4 segs, totalDocs+1). Cascade's generation bump must NOT be visible.
+    expect(mgr.commitGeneration()).toBe(preGen + 1);
+    expect(mgr.indexTotalDocs).toBe(preTotalDocs + 1);
+    expect(mgr.indexTotalLen).toBe(preTotalLen + 1);
+    expect(mgr.segments().length).toBe(preSegs + 1); // 4 tier-0 segs — merge not committed
+
+    // Restore and compact successfully — generation advances once more.
+    backend.writeBlob = realWrite;
+    await mgr.compact();
+    expect(mgr.commitGeneration()).toBe(preGen + 2);
+    expect(mgr.segments().length).toBe(1);
+  });
+
+  it("flushLocked: onBeforeManifest failure leaves manifest uncommitted and buffer preserved", async () => {
+    let hookCalls = 0;
+    const mgr = await SegmentManager.open({
+      backend,
+      onBeforeManifest: async () => {
+        hookCalls++;
+        throw new Error("simulated docids journal write failure");
+      },
+    });
+    await mgr.add(0, [{ term: "x", tf: 1 }]);
+
+    const preTotalDocs = mgr.indexTotalDocs;
+    const preGen = mgr.commitGeneration();
+    const preSegs = mgr.segments().length;
+    const preBuffered = mgr.bufferedCount();
+
+    await expect(mgr.flush()).rejects.toThrow("simulated docids journal write failure");
+
+    expect(hookCalls).toBe(1);
+    expect(mgr.indexTotalDocs).toBe(preTotalDocs);
+    expect(mgr.commitGeneration()).toBe(preGen);
+    expect(mgr.segments().length).toBe(preSegs);
+    expect(mgr.bufferedCount()).toBe(preBuffered);
+  });
 });
 
 describe("SegmentManager — multiple docs per segment", () => {

@@ -654,22 +654,27 @@ export class SegmentManager {
     const newTotalDocs = newSegmentList.reduce((s, e) => s + e.docCount, 0);
     const newTotalLen = newSegmentList.reduce((s, e) => s + e.totalLen, 0);
 
-    this.generation++;
+    // Build new state into locals, then commit atomically: writeManifest first,
+    // then update all in-memory fields together. If writeManifest throws, nothing
+    // is mutated and the live process stays consistent (generation/totals/snapshot
+    // all unchanged).
+    const newGeneration = this.generation + 1;
+    const newSurvivingReaders = this.readerSnapshot.filter((_, i) => !toMergeIndices.has(i));
     await this.writeManifest({
       version: MANIFEST_VERSION,
-      generation: this.generation,
+      generation: newGeneration,
       segments: newSegmentList,
       tokenizer: this.tokenizerConfig,
       totalDocs: newTotalDocs,
       totalLen: newTotalLen,
     });
 
-    // Atomically swap in-memory state after manifest commit.
+    // writeManifest succeeded — commit all in-memory state at once.
+    this.generation = newGeneration;
     this.totalDocs = newTotalDocs;
     this.totalLen = newTotalLen;
     this.manifestSegments = newSegmentList;
-    const survivingReaders = this.readerSnapshot.filter((_, i) => !toMergeIndices.has(i));
-    this.readerSnapshot = [mergedReader, ...survivingReaders];
+    this.readerSnapshot = [mergedReader, ...newSurvivingReaders];
 
     // --- Step 4: delete old segment files (post-manifest-commit) ---
     for (const oldId of toMergeIds) {
