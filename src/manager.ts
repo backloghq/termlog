@@ -381,7 +381,7 @@ export class SegmentManager {
 
       if (this.pendingTombstones.size > 0) {
         writer.setTombstones([...this.pendingTombstones]);
-        this.pendingTombstones = new Set();
+        // Don't clear pendingTombstones yet — cleared below after writeManifest succeeds.
       }
 
       const sortedTerms = [...termMap.keys()].sort();
@@ -441,6 +441,7 @@ export class SegmentManager {
     this.manifestSegments = newManifestSegments;
     this.readerSnapshot = [...this.readerSnapshot, newReader];
     this.buffer = [];
+    this.pendingTombstones = new Set();
   }
 
   /**

@@ -274,6 +274,38 @@ describe("manifest-before-reader-open invariant", () => {
     expect(mgr.segments().length).toBe(preSegs + 1);
     expect(mgr.bufferedCount()).toBe(0);
   });
+
+  it("flushLocked: writeManifest failure preserves pendingTombstones for retry", async () => {
+    const mgr = await SegmentManager.open({ backend });
+    await mgr.add(0, [{ term: "a", tf: 1 }]);
+    await mgr.flush(); // doc 0 committed to segment 0
+
+    // Queue a tombstone for doc 0 and a new doc in the buffer.
+    await mgr.remove(0);
+    await mgr.add(1, [{ term: "b", tf: 1 }]);
+
+    // Stub manifest write to fail.
+    const realWrite = backend.writeBlob.bind(backend);
+    backend.writeBlob = async (path: string, data: Buffer) => {
+      if (path === "manifest.json") throw new Error("simulated manifest write failure");
+      return realWrite(path, data);
+    };
+
+    await expect(mgr.flush()).rejects.toThrow("simulated manifest write failure");
+
+    // Restore and retry — tombstone for doc 0 must still be pending.
+    backend.writeBlob = realWrite;
+    await mgr.flush();
+
+    // The new segment (seg-000001) must carry the tombstone for doc 0.
+    const segs = mgr.segments();
+    expect(segs).toHaveLength(2);
+    const newSeg = segs[segs.length - 1];
+    expect(newSeg.isTombstoned(0)).toBe(true);
+    // Doc 1 (the buffered add) must be in the new segment.
+    const { docIds } = newSeg.decodePostings("b");
+    expect(docIds).toContain(1);
+  });
 });
 
 describe("SegmentManager — multiple docs per segment", () => {
