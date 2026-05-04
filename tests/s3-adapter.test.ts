@@ -10,6 +10,8 @@ import type {
   S3CommandConstructors,
   S3GetObjectOutput,
   S3ListObjectsOutput,
+  S3CreateMultipartUploadOutput,
+  S3UploadPartOutput,
 } from "../src/s3-adapter.js";
 import type { StorageBackend } from "../src/storage.js";
 
@@ -223,5 +225,241 @@ describe("S3StorageAdapter — error propagation", () => {
     // Must not be silently converted to ENOENT — the original error propagates.
     expect(err.name).toBe("AccessDenied");
     expect((err as NodeJS.ErrnoException).code).not.toBe("ENOENT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multipart upload mock helper
+// ---------------------------------------------------------------------------
+
+interface MultipartState {
+  uploads: Map<string, { parts: Map<number, Buffer>; completed: boolean; aborted: boolean }>;
+  store: Map<string, Buffer>;
+  putCalls: Array<{ key: string; body: Buffer }>;
+}
+
+function buildMultipartMock(): {
+  client: S3Client;
+  commands: S3CommandConstructors;
+  state: MultipartState;
+} {
+  const state: MultipartState = {
+    uploads: new Map(),
+    store: new Map(),
+    putCalls: [],
+  };
+
+  let uploadCounter = 0;
+
+  class GetObjectCommand { constructor(public input: { Bucket: string; Key: string }) {} }
+  class PutObjectCommand { constructor(public input: { Bucket: string; Key: string; Body: Uint8Array; ContentType?: string }) {} }
+  class DeleteObjectCommand { constructor(public input: { Bucket: string; Key: string }) {} }
+  class ListObjectsV2Command { constructor(public input: { Bucket: string; Prefix?: string; ContinuationToken?: string }) {} }
+  class CreateMultipartUploadCommand { constructor(public input: { Bucket: string; Key: string; ContentType?: string }) {} }
+  class UploadPartCommand { constructor(public input: { Bucket: string; Key: string; UploadId: string; PartNumber: number; Body: Uint8Array }) {} }
+  class CompleteMultipartUploadCommand { constructor(public input: { Bucket: string; Key: string; UploadId: string; MultipartUpload: { Parts: Array<{ PartNumber: number; ETag: string }> } }) {} }
+  class AbortMultipartUploadCommand { constructor(public input: { Bucket: string; Key: string; UploadId: string }) {} }
+
+  const client: S3Client = {
+    async send(cmd: object): Promise<unknown> {
+      if (cmd instanceof CreateMultipartUploadCommand) {
+        const uploadId = `upload-${++uploadCounter}`;
+        state.uploads.set(uploadId, { parts: new Map(), completed: false, aborted: false });
+        return { UploadId: uploadId } satisfies S3CreateMultipartUploadOutput;
+      }
+      if (cmd instanceof UploadPartCommand) {
+        const upload = state.uploads.get(cmd.input.UploadId);
+        if (!upload) throw new Error(`No upload: ${cmd.input.UploadId}`);
+        upload.parts.set(cmd.input.PartNumber, Buffer.from(cmd.input.Body));
+        return { ETag: `etag-${cmd.input.PartNumber}` } satisfies S3UploadPartOutput;
+      }
+      if (cmd instanceof CompleteMultipartUploadCommand) {
+        const upload = state.uploads.get(cmd.input.UploadId);
+        if (!upload) throw new Error(`No upload: ${cmd.input.UploadId}`);
+        upload.completed = true;
+        // Assemble parts in order into store.
+        const orderedParts = cmd.input.MultipartUpload.Parts
+          .slice()
+          .sort((a, b) => a.PartNumber - b.PartNumber);
+        const assembled = Buffer.concat(orderedParts.map((p) => upload.parts.get(p.PartNumber)!));
+        state.store.set(cmd.input.Key, assembled);
+        return {};
+      }
+      if (cmd instanceof AbortMultipartUploadCommand) {
+        const upload = state.uploads.get(cmd.input.UploadId);
+        if (upload) upload.aborted = true;
+        return {};
+      }
+      if (cmd instanceof PutObjectCommand) {
+        const body = Buffer.from(cmd.input.Body);
+        state.store.set(cmd.input.Key, body);
+        state.putCalls.push({ key: cmd.input.Key, body });
+        return {};
+      }
+      if (cmd instanceof GetObjectCommand) {
+        const data = state.store.get(cmd.input.Key);
+        if (!data) { const e = new Error("NoSuchKey") as Error & { name: string }; e.name = "NoSuchKey"; throw e; }
+        return { Body: { async transformToByteArray() { return new Uint8Array(data); } } } satisfies S3GetObjectOutput;
+      }
+      if (cmd instanceof DeleteObjectCommand) { state.store.delete(cmd.input.Key); return {}; }
+      if (cmd instanceof ListObjectsV2Command) { return { Contents: [], IsTruncated: false }; }
+      throw new Error(`Unexpected command: ${String(cmd)}`);
+    },
+  };
+
+  return {
+    client,
+    commands: {
+      GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
+      CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+    },
+    state,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// createWriteStream — multipart upload tests
+// ---------------------------------------------------------------------------
+
+describe("S3StorageAdapter — createWriteStream multipart", () => {
+  const MIN_PART = 5 * 1024 * 1024; // 5 MiB
+
+  it("sub-5MiB write → exactly 1 UploadPart then Complete with 1 part", async () => {
+    const { client, commands, state } = buildMultipartMock();
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "p/" });
+
+    const stream = await adapter.createWriteStream("obj.seg");
+    const payload = Buffer.alloc(1024, 0x41); // 1 KiB
+    await stream.write(payload);
+    await stream.end();
+
+    // One upload, completed, not aborted.
+    expect(state.uploads.size).toBe(1);
+    const [, upload] = [...state.uploads.entries()][0];
+    expect(upload.completed).toBe(true);
+    expect(upload.aborted).toBe(false);
+    expect(upload.parts.size).toBe(1); // exactly 1 UploadPart
+
+    // Content correct in store.
+    expect(state.store.get("p/obj.seg")).toEqual(payload);
+  });
+
+  it(">5MiB total → at least 2 UploadParts in correct PartNumber order with ETags", { timeout: 15000 }, async () => {
+    const { client, commands, state } = buildMultipartMock();
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "p/" });
+
+    const stream = await adapter.createWriteStream("obj.seg");
+    // chunk1 is slightly > MIN_PART to trigger an automatic part flush.
+    // chunk2 is small — flushed by end(), producing a second part.
+    const chunk1 = Buffer.alloc(MIN_PART + 1, 0x41);
+    await stream.write(chunk1);
+    const chunk2 = Buffer.alloc(1024, 0x42);
+    await stream.write(chunk2);
+    await stream.end();
+
+    const [, upload] = [...state.uploads.entries()][0];
+    expect(upload.completed).toBe(true);
+    expect(upload.parts.size).toBeGreaterThanOrEqual(2);
+
+    // Assembled content matches.
+    const expected = Buffer.concat([chunk1, chunk2]);
+    expect(state.store.get("p/obj.seg")).toEqual(expected);
+
+    // Part numbers are strictly ascending starting at 1.
+    const partNumbers = [...upload.parts.keys()].sort((a, b) => a - b);
+    expect(partNumbers[0]).toBe(1);
+    for (let i = 1; i < partNumbers.length; i++) {
+      expect(partNumbers[i]).toBe(partNumbers[i - 1] + 1);
+    }
+  });
+
+  it("UploadPart throws on second call — error propagates from write(); caller abort() sends AbortMultipartUpload", async () => {
+    const { client: baseClient, commands, state } = buildMultipartMock();
+    let partCallCount = 0;
+    const client: S3Client = {
+      async send(cmd: object): Promise<unknown> {
+        // Intercept UploadPartCommand to fail on the second call.
+        const { UploadPartCommand: UPC } = commands;
+        if (UPC && cmd instanceof UPC) {
+          partCallCount++;
+          if (partCallCount === 2) throw new Error("UploadPart network failure");
+        }
+        return baseClient.send(cmd);
+      },
+    };
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "p/" });
+
+    const stream = await adapter.createWriteStream("obj.seg");
+    // First write: > 5 MiB → triggers first UploadPart (succeeds).
+    await stream.write(Buffer.alloc(MIN_PART + 1, 0x41));
+    // Second write: > 5 MiB → triggers second UploadPart (throws).
+    const writeErr = await stream.write(Buffer.alloc(MIN_PART + 1, 0x42)).catch((e) => e) as Error;
+    expect(writeErr.message).toMatch(/network failure/);
+
+    // Adapter does NOT auto-abort — caller must abort.
+    const [uploadId, upload] = [...state.uploads.entries()][0];
+    expect(upload.aborted).toBe(false);
+
+    // Caller aborts explicitly.
+    await stream.abort();
+    expect(upload.aborted).toBe(true);
+    void uploadId;
+  });
+
+  it("Complete throws — AbortMultipartUpload is sent automatically before re-throwing", async () => {
+    const { client: baseClient, commands, state } = buildMultipartMock();
+    const client: S3Client = {
+      async send(cmd: object): Promise<unknown> {
+        const { CompleteMultipartUploadCommand: CMP } = commands;
+        if (CMP && cmd instanceof CMP) throw new Error("Complete network failure");
+        return baseClient.send(cmd);
+      },
+    };
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "p/" });
+
+    const stream = await adapter.createWriteStream("obj.seg");
+    await stream.write(Buffer.alloc(1024, 0x41));
+    const endErr = await stream.end().catch((e) => e) as Error;
+
+    expect(endErr.message).toMatch(/Complete network failure/);
+
+    // AbortMultipartUpload must have been sent automatically.
+    const [, upload] = [...state.uploads.entries()][0];
+    expect(upload.aborted).toBe(true);
+    // Object must NOT appear in the store.
+    expect(state.store.has("p/obj.seg")).toBe(false);
+  });
+
+  it("zero-byte end() — AbortMultipartUpload sent, falls back to PutObject with empty body", async () => {
+    const { client, commands, state } = buildMultipartMock();
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "p/" });
+
+    const stream = await adapter.createWriteStream("obj.seg");
+    await stream.end(); // no writes
+
+    // Upload must be aborted (not completed).
+    const [, upload] = [...state.uploads.entries()][0];
+    expect(upload.aborted).toBe(true);
+    expect(upload.completed).toBe(false);
+
+    // Object is present via PutObject fallback with empty body.
+    expect(state.putCalls).toHaveLength(1);
+    expect(state.putCalls[0].body).toEqual(Buffer.alloc(0));
+    expect(state.store.get("p/obj.seg")).toEqual(Buffer.alloc(0));
+  });
+
+  it("missing multipart command constructors → throws at createWriteStream, not at write()", async () => {
+    const { client, commands } = buildMultipartMock();
+    // Strip multipart commands.
+    const cmdsWithout: S3CommandConstructors = {
+      GetObjectCommand: commands.GetObjectCommand,
+      PutObjectCommand: commands.PutObjectCommand,
+      DeleteObjectCommand: commands.DeleteObjectCommand,
+      ListObjectsV2Command: commands.ListObjectsV2Command,
+      // no multipart commands
+    };
+    const adapter = new S3StorageAdapter({ client, commands: cmdsWithout, bucket: "b", prefix: "p/" });
+
+    await expect(adapter.createWriteStream("obj.seg")).rejects.toThrow(/requires CreateMultipartUploadCommand/);
   });
 });
