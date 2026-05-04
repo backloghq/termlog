@@ -534,6 +534,14 @@ export class SegmentManager {
 
     const newSegmentList = [mergedEntry, ...survivingEntries];
 
+    // Derive totalDocs and totalLen from the new segment list so tombstoned docs
+    // are reflected immediately rather than relying on the running counter (which
+    // was only ever incremented, never decremented).
+    const newTotalDocs = newSegmentList.reduce((s, e) => s + e.docCount, 0);
+    const newTotalLen = newSegmentList.reduce((s, e) => s + e.totalLen, 0);
+    this.totalDocs = newTotalDocs;
+    this.totalLen = newTotalLen;
+
     this.generation++;
     await this.writeManifest({
       version: MANIFEST_VERSION,
