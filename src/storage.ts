@@ -7,11 +7,30 @@ import { readFile, readdir, unlink, rename, open } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { mkdir } from "node:fs/promises";
 
+/**
+ * Streaming write handle returned by `StorageBackend.createWriteStream`.
+ * Chunks become visible at the target path only after `end()` resolves.
+ * `abort()` discards the in-progress write and leaves nothing at the path.
+ */
+export interface WriteStream {
+  write(chunk: Buffer): Promise<void>;
+  /** Atomically commits all written chunks to `path`. */
+  end(): Promise<void>;
+  /** Discards the in-progress write. */
+  abort(): Promise<void>;
+}
+
 export interface StorageBackend {
   readBlob(path: string): Promise<Buffer>;
   writeBlob(path: string, data: Buffer): Promise<void>;
   listBlobs(prefix: string): Promise<string[]>;
   deleteBlob(path: string): Promise<void>;
+  /**
+   * Open a streaming write handle for `path`. Chunks written via `write()` are
+   * buffered/streamed but not visible until `end()` commits atomically.
+   * On error call `abort()` to clean up.
+   */
+  createWriteStream(path: string): Promise<WriteStream>;
   /**
    * Append `data` to the end of `path`, creating it if absent.
    * Optional — callers fall back to read-modify-writeBlob on backends that omit this.
@@ -108,5 +127,35 @@ export class FsBackend implements StorageBackend {
     } finally {
       await fh.close();
     }
+  }
+
+  async createWriteStream(path: string): Promise<WriteStream> {
+    const dest = this.abs(path);
+    const dir = dirname(dest);
+    await mkdir(dir, { recursive: true });
+    const tmp = `${dest}.${process.hrtime.bigint()}.tmp`;
+    const fh = await open(tmp, "w");
+    let done = false;
+
+    return {
+      async write(chunk: Buffer): Promise<void> {
+        await fh.write(chunk);
+      },
+      async end(): Promise<void> {
+        if (done) return;
+        done = true;
+        await fh.sync();
+        await fh.close();
+        await rename(tmp, dest);
+        const dh = await open(dir, "r");
+        try { await dh.sync(); } finally { await dh.close(); }
+      },
+      async abort(): Promise<void> {
+        if (done) return;
+        done = true;
+        await fh.close().catch(() => undefined);
+        await unlink(tmp).catch(() => undefined);
+      },
+    };
   }
 }

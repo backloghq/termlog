@@ -21,3 +21,23 @@ export function crc32(buf: Buffer): number {
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
+
+/**
+ * Incremental CRC32 for streaming use.
+ * Call update() for each chunk; call digest() to get the final value.
+ */
+export class Crc32Stream {
+  private crc = 0xffffffff;
+
+  update(buf: Buffer): void {
+    let crc = this.crc;
+    for (let i = 0; i < buf.length; i++) {
+      crc = TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+    }
+    this.crc = crc;
+  }
+
+  digest(): number {
+    return (this.crc ^ 0xffffffff) >>> 0;
+  }
+}

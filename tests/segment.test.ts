@@ -9,25 +9,21 @@ async function makeTmpDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "termlog-seg-"));
 }
 
-/** Build a writer with a small fixed corpus. */
-function buildWriter(): SegmentWriter {
-  const w = new SegmentWriter();
-  // doc 0: "rust language programming"
-  w.addPosting("rust", 0, 2);
-  w.addPosting("language", 0, 1);
-  w.addPosting("programming", 0, 1);
+/** Build and flush a small fixed corpus using the streaming writer API. */
+async function buildAndFlush(id: string, backend: FsBackend): Promise<void> {
+  const stream = await backend.createWriteStream(`${id}.seg`);
+  const w = new SegmentWriter(stream);
   w.setDocLength(0, 4);
-  // doc 1: "typescript language types"
-  w.addPosting("typescript", 1, 3);
-  w.addPosting("language", 1, 1);
-  w.addPosting("types", 1, 2);
   w.setDocLength(1, 6);
-  // doc 2: "rust types safety"
-  w.addPosting("rust", 2, 1);
-  w.addPosting("types", 2, 1);
-  w.addPosting("safety", 2, 1);
   w.setDocLength(2, 3);
-  return w;
+  // Terms must be in lex order; docIds must be sorted within each term.
+  await w.writeTerm("language",    [0, 1], [1, 1]);
+  await w.writeTerm("programming", [0],    [1]);
+  await w.writeTerm("rust",        [0, 2], [2, 1]);
+  await w.writeTerm("safety",      [2],    [1]);
+  await w.writeTerm("typescript",  [1],    [3]);
+  await w.writeTerm("types",       [1, 2], [2, 1]);
+  await w.finish();
 }
 
 describe("SegmentWriter + SegmentReader — round-trip", () => {
@@ -43,17 +39,15 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("flush produces a .seg file and no orphaned .tmp", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+  it("finish produces a .seg file and no orphaned .tmp", async () => {
+    await buildAndFlush("seg-001", backend);
     const files = await backend.listBlobs("");
     expect(files).toContain("seg-001.seg");
     expect(files.filter((f) => f.endsWith(".tmp"))).toHaveLength(0);
   });
 
   it("reader recovers all posting lists identically", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
 
     const rust = r.decodePostings("rust");
@@ -70,8 +64,7 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
   });
 
   it("reader recovers doc lengths", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
 
     expect(r.docLen(0)).toBe(4);
@@ -81,8 +74,7 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
   });
 
   it("termCount and docCount are correct", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
 
     // rust, language, programming, typescript, types, safety = 6
@@ -91,8 +83,7 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
   });
 
   it("lookupTerm returns entry with correct df", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
 
     expect(r.lookupTerm("rust")?.df).toBe(2);    // appears in docs 0, 2
@@ -101,8 +92,7 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
   });
 
   it("postings iterator matches decodePostings", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
 
     const iter = r.postings("rust");
@@ -115,15 +105,13 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
   });
 
   it("postings iterator for missing term is immediately done", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
     expect(r.postings("nonexistent").next().done).toBe(true);
   });
 
   it("terms() iterates all terms in sorted order", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const r = await SegmentReader.open("seg-001.seg", backend);
 
     const terms = [...r.terms()].map((e) => e.term);
@@ -135,26 +123,32 @@ describe("SegmentWriter + SegmentReader — round-trip", () => {
   });
 
   it("100-term round-trip: all postings recover identically", async () => {
-    const w = new SegmentWriter();
+    const stream = await backend.createWriteStream("seg-big.seg");
+    const w = new SegmentWriter(stream);
     const expected = new Map<string, { docIds: number[]; tfs: number[] }>();
 
+    // Build sorted list of (term, docIds, tfs) — terms must be written in lex order.
+    const termList: Array<{ term: string; docIds: number[]; tfs: number[] }> = [];
     for (let t = 0; t < 100; t++) {
       const term = `term${String(t).padStart(3, "0")}`;
       const docIds: number[] = [];
       const tfs: number[] = [];
-      // Each term appears in 5 docs with varying tf
       for (let d = 0; d < 5; d++) {
         const docId = t * 5 + d;
         const tf = (d + 1);
-        w.addPosting(term, docId, tf);
         w.setDocLength(docId, tf * 3);
         docIds.push(docId);
         tfs.push(tf);
       }
       expected.set(term, { docIds, tfs });
+      termList.push({ term, docIds, tfs });
     }
+    termList.sort((a, b) => a.term < b.term ? -1 : 1);
+    for (const { term, docIds, tfs } of termList) {
+      await w.writeTerm(term, docIds, tfs);
+    }
+    await w.finish();
 
-    await w.flush("seg-big", backend);
     const r = await SegmentReader.open("seg-big.seg", backend);
 
     for (const [term, exp] of expected) {
@@ -179,8 +173,7 @@ describe("SegmentReader — corruption detection", () => {
   });
 
   it("throws SegmentCorruptionError with region='postings' when postings region is corrupted", async () => {
-    const w = buildWriter();
-    await w.flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const data = await backend.readBlob("seg-001.seg");
     // Corrupt byte 0 (start of postings region, if non-empty)
     if (data.length > 64) {
@@ -194,7 +187,7 @@ describe("SegmentReader — corruption detection", () => {
   });
 
   it("throws SegmentCorruptionError with region='footer' for bad magic", async () => {
-    await buildWriter().flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const data = await backend.readBlob("seg-001.seg");
     // Footer starts at data.length - 64; corrupt the magic (first 4 bytes of footer)
     data[data.length - 64] ^= 0xff;
@@ -207,7 +200,7 @@ describe("SegmentReader — corruption detection", () => {
   });
 
   it("throws SegmentCorruptionError with region='dict' when dict region is corrupted", async () => {
-    await buildWriter().flush("seg-001", backend);
+    await buildAndFlush("seg-001", backend);
     const data = await backend.readBlob("seg-001.seg");
     // Footer: dictOffset at bytes footer+32..+36 (offset from footerStart)
     const footerStart = data.length - 64;
@@ -223,7 +216,7 @@ describe("SegmentReader — corruption detection", () => {
   });
 });
 
-describe("SegmentWriter — postings in any order", () => {
+describe("SegmentWriter — docIds sorted within term", () => {
   let dir: string;
   let backend: FsBackend;
 
@@ -236,15 +229,16 @@ describe("SegmentWriter — postings in any order", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("addPosting in reverse doc-ID order still produces sorted posting lists", async () => {
-    const w = new SegmentWriter();
-    w.addPosting("word", 100, 1);
-    w.addPosting("word", 50, 2);
-    w.addPosting("word", 10, 3);
+  it("writeTerm with sorted docIds produces correct posting lists", async () => {
+    const stream = await backend.createWriteStream("seg-order.seg");
+    const w = new SegmentWriter(stream);
     w.setDocLength(10, 3);
     w.setDocLength(50, 2);
     w.setDocLength(100, 1);
-    await w.flush("seg-order", backend);
+    // Caller passes sorted docIds to writeTerm.
+    await w.writeTerm("word", [10, 50, 100], [3, 2, 1]);
+    await w.finish();
+
     const r = await SegmentReader.open("seg-order.seg", backend);
     const { docIds, tfs } = r.decodePostings("word");
     expect(docIds).toEqual([10, 50, 100]);
