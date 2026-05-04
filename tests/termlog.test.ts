@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { rm, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writeFile } from "node:fs/promises";
 import { TermLog } from "../src/termlog.js";
 import { FsBackend } from "../src/storage.js";
 
@@ -121,5 +122,18 @@ describe("TermLog facade", () => {
     await expect(tl.remove("nonexistent")).resolves.not.toThrow();
     const results = await tl.search("hello");
     expect(results.map((r) => r.docId)).toContain("doc-a");
+  });
+
+  it("MappingCorruptionError when docids.json is invalid JSON", async () => {
+    // Create a valid index, then corrupt docids.json before reopening.
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 100 });
+    await tl.add("x", "hello");
+    await tl.close();
+
+    // Overwrite docids.json with invalid content.
+    await writeFile(join(dir, "docids.json"), "not valid json");
+
+    await expect(TermLog.open({ dir, backend, flushThreshold: 100 }))
+      .rejects.toMatchObject({ name: "MappingCorruptionError" });
   });
 });

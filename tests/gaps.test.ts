@@ -151,6 +151,30 @@ describe("FsBackend concurrent writeBlob", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tombstone region CRC corruption
+// ---------------------------------------------------------------------------
+
+describe("tombstone CRC corruption", () => {
+  it("throws SegmentCorruptionError with region=tombstones", async () => {
+    const w = new SegmentWriter();
+    w.addPosting("cat", 0, 1);
+    w.setDocLength(0, 1);
+    // Write a real tombstone so the region is non-trivial.
+    w.setTombstones([42]);
+    await w.flush("seg-tc", backend);
+    const data = await backend.readBlob("seg-tc.seg");
+    // Footer: tombstonesOffset is at footerStart + 24
+    //   (magic4 + version4 + postingsOffset4 + postingsLength4 + sidecarOffset4 + sidecarLength4)
+    const footerStart = data.length - 64;
+    const tombstonesOffset = data.readUInt32LE(footerStart + 24);
+    data[tombstonesOffset] ^= 0xff;
+    await writeFile(join(dir, "seg-tc.seg"), data);
+    await expect(SegmentReader.open("seg-tc.seg", backend))
+      .rejects.toMatchObject({ name: "SegmentCorruptionError", region: "tombstones" });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tokenizer parity with agentdb
 // ---------------------------------------------------------------------------
 
