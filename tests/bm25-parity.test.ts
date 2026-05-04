@@ -174,19 +174,34 @@ beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), "termlog-bm25-"));
   backend = new FsBackend(dir);
 
-  const writer = new SegmentWriter();
   totalLen = 0;
+
+  // Accumulate per-term postings across all docs.
+  const termPostings = new Map<string, { docIds: number[]; tfs: number[] }>();
+  const stream = await backend.createWriteStream("seg-parity.seg");
+  const writer = new SegmentWriter(stream);
 
   for (const doc of CORPUS) {
     const tokens = tokenize(doc.text);
     const tfMap = new Map<string, number>();
     for (const t of tokens) tfMap.set(t, (tfMap.get(t) ?? 0) + 1);
-    for (const [term, tf] of tfMap) writer.addPosting(term, doc.id, tf);
+    for (const [term, tf] of tfMap) {
+      let entry = termPostings.get(term);
+      if (!entry) { entry = { docIds: [], tfs: [] }; termPostings.set(term, entry); }
+      entry.docIds.push(doc.id);
+      entry.tfs.push(tf);
+    }
     writer.setDocLength(doc.id, tokens.length);
     totalLen += tokens.length;
   }
 
-  await writer.flush("seg-parity", backend);
+  // writeTerm in lex order; docIds are already in corpus order (ascending id).
+  const sortedTerms = [...termPostings.keys()].sort();
+  for (const term of sortedTerms) {
+    const { docIds, tfs } = termPostings.get(term)!;
+    await writer.writeTerm(term, docIds, tfs);
+  }
+  await writer.finish();
   seg = await SegmentReader.open("seg-parity.seg", backend);
   N = CORPUS.length;
 });

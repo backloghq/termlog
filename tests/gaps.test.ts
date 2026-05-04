@@ -86,10 +86,11 @@ describe("decodeVByte edge cases", () => {
 
 describe("segment version mismatch", () => {
   it("throws SegmentCorruptionError with region=footer for wrong version", async () => {
-    const w = new SegmentWriter();
-    w.addPosting("a", 0, 1);
+    const stream = await backend.createWriteStream("seg-v.seg");
+    const w = new SegmentWriter(stream);
     w.setDocLength(0, 1);
-    await w.flush("seg-v", backend);
+    await w.writeTerm("a", [0], [1]);
+    await w.finish();
     const data = await backend.readBlob("seg-v.seg");
     // Footer version is at footerStart + 4 (after magic).
     const footerStart = data.length - 64;
@@ -107,10 +108,11 @@ describe("segment version mismatch", () => {
 describe("footer too small", () => {
   it("throws SegmentCorruptionError with region=footer for a truncated file", async () => {
     // Write a valid segment, then truncate it below FOOTER_SIZE bytes.
-    const w = new SegmentWriter();
-    w.addPosting("x", 0, 1);
+    const stream = await backend.createWriteStream("seg-trunc.seg");
+    const w = new SegmentWriter(stream);
     w.setDocLength(0, 1);
-    await w.flush("seg-trunc", backend);
+    await w.writeTerm("x", [0], [1]);
+    await w.finish();
     const data = await backend.readBlob("seg-trunc.seg");
     // Truncate to 10 bytes — definitely < 64-byte footer.
     await writeFile(join(dir, "seg-trunc.seg"), data.subarray(0, 10));
@@ -125,10 +127,11 @@ describe("footer too small", () => {
 
 describe("sidecar CRC corruption", () => {
   it("throws SegmentCorruptionError with region=sidecar", async () => {
-    const w = new SegmentWriter();
-    w.addPosting("fox", 0, 2);
+    const stream = await backend.createWriteStream("seg-sc.seg");
+    const w = new SegmentWriter(stream);
     w.setDocLength(0, 2);
-    await w.flush("seg-sc", backend);
+    await w.writeTerm("fox", [0], [2]);
+    await w.finish();
     const data = await backend.readBlob("seg-sc.seg");
     // Sidecar starts right after postings region.
     // Footer: sidecarOffset at footerStart + 16.
@@ -177,12 +180,12 @@ describe("FsBackend concurrent writeBlob", () => {
 
 describe("tombstone CRC corruption", () => {
   it("throws SegmentCorruptionError with region=tombstones", async () => {
-    const w = new SegmentWriter();
-    w.addPosting("cat", 0, 1);
+    const stream = await backend.createWriteStream("seg-tc.seg");
+    const w = new SegmentWriter(stream);
     w.setDocLength(0, 1);
-    // Write a real tombstone so the region is non-trivial.
     w.setTombstones([42]);
-    await w.flush("seg-tc", backend);
+    await w.writeTerm("cat", [0], [1]);
+    await w.finish();
     const data = await backend.readBlob("seg-tc.seg");
     // Footer: tombstonesOffset is at footerStart + 24
     //   (magic4 + version4 + postingsOffset4 + postingsLength4 + sidecarOffset4 + sidecarLength4)

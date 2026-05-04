@@ -63,10 +63,11 @@ describe("Scenario 2 — orphan .seg (segment written, manifest not updated)", (
     await mgr.add(0, [{ term: "world", tf: 1 }]);
 
     // Inject: an extra .seg that is NOT in the manifest (orphaned segment).
-    const orphanWriter = new SegmentWriter();
-    orphanWriter.addPosting("orphan", 99, 1);
+    const orphanStream = await backend.createWriteStream("seg-orphan.seg");
+    const orphanWriter = new SegmentWriter(orphanStream);
     orphanWriter.setDocLength(99, 1);
-    await orphanWriter.flush("seg-orphan", backend);
+    await orphanWriter.writeTerm("orphan", [99], [1]);
+    await orphanWriter.finish();
 
     // Verify the orphan file exists before reopen.
     const filesBefore = await readdir(dir);
@@ -233,18 +234,7 @@ describe("Scenario 7 — mid-compaction crash: manifest committed, old segs surv
     await mgr.compact();
     await mgr.close();
 
-    // Simulate "old segs not yet deleted" by writing them back as orphans.
-    const orphanWriter = new SegmentWriter();
-    orphanWriter.addPosting("orphan", 999, 1);
-    orphanWriter.setDocLength(999, 1);
-    // Restore the old seg names as orphans (they're not in the manifest).
-    for (const f of beforeFiles) {
-      const id = f.slice(0, -4); // strip ".seg"
-      await (new SegmentWriter()).flush(id, backend).catch(() => {
-        // Flush will throw if SegmentWriter has no data — use orphanWriter.
-      });
-    }
-    // Simpler: just write garbage files with the old names.
+    // Simpler: just write garbage files with the old names (they're not in the manifest).
     for (const f of beforeFiles) {
       await writeFile(join(dir, f), Buffer.from("orphan-data"));
     }

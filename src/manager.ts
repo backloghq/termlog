@@ -360,23 +360,47 @@ export class SegmentManager {
     const segId = `seg-${String(this.nextSegCounter).padStart(6, "0")}`;
     this.nextSegCounter++;
 
-    const writer = new SegmentWriter();
+    const segPath = `${segId}.seg`;
+    const stream = await this.backend.createWriteStream(segPath);
+    const writer = new SegmentWriter(stream);
     let segTotalLen = 0;
 
-    for (const doc of this.buffer) {
-      for (const { term, tf } of doc.terms) {
-        writer.addPosting(term, doc.docId, tf);
+    try {
+      // Group postings by term, then write in lex order.
+      const termMap = new Map<string, { docIds: number[]; tfs: number[] }>();
+      for (const doc of this.buffer) {
+        for (const { term, tf } of doc.terms) {
+          let acc = termMap.get(term);
+          if (!acc) { acc = { docIds: [], tfs: [] }; termMap.set(term, acc); }
+          acc.docIds.push(doc.docId);
+          acc.tfs.push(tf);
+        }
+        writer.setDocLength(doc.docId, doc.totalLen);
+        segTotalLen += doc.totalLen;
       }
-      writer.setDocLength(doc.docId, doc.totalLen);
-      segTotalLen += doc.totalLen;
-    }
 
-    if (this.pendingTombstones.size > 0) {
-      writer.setTombstones([...this.pendingTombstones]);
-      this.pendingTombstones = new Set();
-    }
+      if (this.pendingTombstones.size > 0) {
+        writer.setTombstones([...this.pendingTombstones]);
+        this.pendingTombstones = new Set();
+      }
 
-    await writer.flush(segId, this.backend);
+      const sortedTerms = [...termMap.keys()].sort();
+      for (const term of sortedTerms) {
+        const acc = termMap.get(term)!;
+        // Sort docIds within term (buffer order is docId-insertion order, not sorted).
+        const order = acc.docIds.map((_, i) => i).sort((a, b) => acc.docIds[a] - acc.docIds[b]);
+        await writer.writeTerm(
+          term,
+          order.map((i) => acc.docIds[i]),
+          order.map((i) => acc.tfs[i]),
+        );
+      }
+
+      await writer.finish();
+    } catch (err) {
+      await stream.abort().catch(() => undefined);
+      throw err;
+    }
 
     // Update totals.
     this.totalDocs += this.buffer.length;
@@ -526,81 +550,91 @@ export class SegmentManager {
     const mergedId = `seg-${String(this.nextSegCounter).padStart(6, "0")}`;
     this.nextSegCounter++;
 
-    const writer = new SegmentWriter();
+    const mergedPath = `${mergedId}.seg`;
+    const stream = await this.backend.createWriteStream(mergedPath);
+    const writer = new SegmentWriter(stream);
 
-    interface HeapEntry {
-      segIndex: number;
-      termIter: Generator<DictEntry, void, unknown>;
-      currentTerm: string;
-    }
-
-    const heap = new MinHeap<HeapEntry>((a, b) => {
-      if (a.currentTerm < b.currentTerm) return -1;
-      if (a.currentTerm > b.currentTerm) return 1;
-      return a.segIndex - b.segIndex;
-    });
-
-    for (let si = 0; si < toMergeReaders.length; si++) {
-      const termIter = toMergeReaders[si].terms();
-      const first = termIter.next();
-      if (!first.done) {
-        heap.push({ segIndex: si, termIter, currentTerm: first.value.term });
-      }
-    }
-
-    let prevTerm: string | null = null;
-    let termAccum = new Map<number, number>();
-
-    const flushTerm = () => {
-      if (prevTerm === null || termAccum.size === 0) return;
-      for (const [docId, tf] of termAccum) {
-        writer.addPosting(prevTerm, docId, tf);
-      }
-    };
-
-    while (heap.size > 0) {
-      const top = heap.peek()!;
-
-      if (top.currentTerm !== prevTerm) {
-        flushTerm();
-        termAccum = new Map();
-        prevTerm = top.currentTerm;
-      }
-
-      while (heap.size > 0 && heap.peek()!.currentTerm === prevTerm) {
-        const entry = heap.pop()!;
-        const postIter = toMergeReaders[entry.segIndex].postings(prevTerm!);
-        let posting = postIter.next();
-        while (!posting.done) {
-          const docId = posting.value.docId;
-          if (survivingDocs.has(docId)) {
-            termAccum.set(docId, (termAccum.get(docId) ?? 0) + posting.value.tf);
-          }
-          posting = postIter.next();
-        }
-        const next = entry.termIter.next();
-        if (!next.done) {
-          entry.currentTerm = next.value.term;
-          heap.push(entry);
-        }
-      }
-    }
-    flushTerm();
-
+    // Set doc lengths up front — sidecar is buffered separately (small: 8 bytes/doc).
     for (const [docId, len] of survivingDocs) {
       writer.setDocLength(docId, len);
     }
 
     // Carry forward tombstones that target docs NOT in the merged segments.
-    // A tombstone is unresolved iff its target did NOT appear in any merged segment's sidecar.
-    // tombstonedMergedDocs holds exactly those tombstone targets that were in the merge set,
-    // so the complement (tombstoneUnion minus tombstonedMergedDocs) is the unresolved set.
     const unresolvedTombstones = [...tombstoneUnion].filter((id) => !tombstonedMergedDocs.has(id));
     if (unresolvedTombstones.length > 0) {
       writer.setTombstones(unresolvedTombstones);
     }
 
-    await writer.flush(mergedId, this.backend);
+    try {
+      interface HeapEntry {
+        segIndex: number;
+        termIter: Generator<DictEntry, void, unknown>;
+        currentTerm: string;
+      }
+
+      const heap = new MinHeap<HeapEntry>((a, b) => {
+        if (a.currentTerm < b.currentTerm) return -1;
+        if (a.currentTerm > b.currentTerm) return 1;
+        return a.segIndex - b.segIndex;
+      });
+
+      for (let si = 0; si < toMergeReaders.length; si++) {
+        const termIter = toMergeReaders[si].terms();
+        const first = termIter.next();
+        if (!first.done) {
+          heap.push({ segIndex: si, termIter, currentTerm: first.value.term });
+        }
+      }
+
+      let prevTerm: string | null = null;
+      let termAccum = new Map<number, number>();
+
+      const flushTerm = async (): Promise<void> => {
+        if (prevTerm === null || termAccum.size === 0) return;
+        // termAccum is keyed by docId — sort for delta encoding.
+        const docIds = [...termAccum.keys()].sort((a, b) => a - b);
+        const tfs = docIds.map((id) => termAccum.get(id)!);
+        await writer.writeTerm(prevTerm, docIds, tfs);
+      };
+
+      while (heap.size > 0) {
+        const top = heap.peek()!;
+
+        if (top.currentTerm !== prevTerm) {
+          await flushTerm();
+          termAccum = new Map();
+          prevTerm = top.currentTerm;
+        }
+
+        while (heap.size > 0 && heap.peek()!.currentTerm === prevTerm) {
+          const entry = heap.pop()!;
+          const postIter = toMergeReaders[entry.segIndex].postings(prevTerm!);
+          let posting = postIter.next();
+          while (!posting.done) {
+            const docId = posting.value.docId;
+            if (survivingDocs.has(docId)) {
+              termAccum.set(docId, (termAccum.get(docId) ?? 0) + posting.value.tf);
+            }
+            posting = postIter.next();
+          }
+          const next = entry.termIter.next();
+          if (!next.done) {
+            entry.currentTerm = next.value.term;
+            heap.push(entry);
+          }
+        }
+      }
+      await flushTerm();
+
+      // Source reader Buffers are no longer needed after the heap is exhausted.
+      // Nulling the array ref lets GC reclaim postingsRegion Buffers before finish().
+      toMergeReaders.length = 0;
+
+      await writer.finish();
+    } catch (err) {
+      await stream.abort().catch(() => undefined);
+      throw err;
+    }
 
     // --- Step 3: atomic manifest swap ---
     const mergedEntry: ManifestSegmentEntry = {

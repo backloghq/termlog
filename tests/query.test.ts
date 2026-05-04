@@ -24,15 +24,37 @@ async function writeSegment(
   entries: Array<[number, string, number]>,
   docLens?: Map<number, number>,
 ): Promise<SegmentReader> {
-  const writer = new SegmentWriter();
-  for (const [docId, term, tf] of entries) writer.addPosting(term, docId, tf);
+  // Accumulate per-term postings.
+  const termMap = new Map<string, { docIds: number[]; tfs: number[] }>();
+  for (const [docId, term, tf] of entries) {
+    let e = termMap.get(term);
+    if (!e) { e = { docIds: [], tfs: [] }; termMap.set(term, e); }
+    e.docIds.push(docId);
+    e.tfs.push(tf);
+  }
+  // Sort docIds within each term.
+  for (const e of termMap.values()) {
+    const pairs = e.docIds.map((d, i) => [d, e.tfs[i]] as [number, number]);
+    pairs.sort((a, b) => a[0] - b[0]);
+    e.docIds = pairs.map((p) => p[0]);
+    e.tfs = pairs.map((p) => p[1]);
+  }
+
+  const stream = await backend.createWriteStream(`${id}.seg`);
+  const writer = new SegmentWriter(stream);
+
   if (docLens) {
     for (const [docId, len] of docLens) writer.setDocLength(docId, len);
   } else {
     const seen = new Set(entries.map(([d]) => d));
     for (const d of seen) writer.setDocLength(d, 1);
   }
-  await writer.flush(id, backend);
+
+  for (const term of [...termMap.keys()].sort()) {
+    const { docIds, tfs } = termMap.get(term)!;
+    await writer.writeTerm(term, docIds, tfs);
+  }
+  await writer.finish();
   return SegmentReader.open(`${id}.seg`, backend);
 }
 
