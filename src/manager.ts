@@ -86,6 +86,13 @@ export interface SegmentManagerOpts {
   /** How many segments trigger automatic compaction. Default: 8. */
   mergeThreshold?: number;
   tokenizer?: TokenizerConfig;
+  /**
+   * Called after the segment file is written but BEFORE the manifest is committed.
+   * Use this to persist any side-data (e.g. docIds mapping) that must be consistent
+   * with the manifest. A crash after this callback but before manifest commit leaves
+   * the side-data ahead of the manifest — safe, because the mapping only grows.
+   */
+  onBeforeManifest?: () => Promise<void>;
 }
 
 export class SegmentManager {
@@ -93,6 +100,7 @@ export class SegmentManager {
   private readonly flushThreshold: number;
   private readonly mergeThreshold: number;
   private readonly tokenizerConfig: TokenizerConfig;
+  private readonly onBeforeManifest: (() => Promise<void>) | undefined;
   /** Absolute path to the .lock file, or null for non-local-FS backends. */
   private lockPath: string | null = null;
 
@@ -127,11 +135,13 @@ export class SegmentManager {
     flushThreshold: number,
     mergeThreshold: number,
     tokenizerConfig: TokenizerConfig,
+    onBeforeManifest?: () => Promise<void>,
   ) {
     this.backend = backend;
     this.flushThreshold = flushThreshold;
     this.mergeThreshold = mergeThreshold;
     this.tokenizerConfig = tokenizerConfig;
+    this.onBeforeManifest = onBeforeManifest;
   }
 
   static async open(opts: SegmentManagerOpts): Promise<SegmentManager> {
@@ -140,6 +150,7 @@ export class SegmentManager {
       opts.flushThreshold ?? 1000,
       opts.mergeThreshold ?? DEFAULT_MERGE_THRESHOLD,
       opts.tokenizer ?? { kind: "unicode", minLen: 1 },
+      opts.onBeforeManifest,
     );
     // Acquire advisory lock for local FS backends to prevent multi-process corruption.
     if (opts.dir && opts.backend.isLocalFs?.()) {
@@ -355,6 +366,11 @@ export class SegmentManager {
     // Clear buffer before manifest update so a crash between flush and manifest
     // update leaves an orphaned .seg (safe — manifest is the source of truth).
     this.buffer = [];
+
+    // Persist any side-data (e.g. docId mapping) before the manifest commit so
+    // the two are always consistent: if the process crashes here, the mapping is
+    // ahead of the manifest (harmless — extra entries); never behind it.
+    if (this.onBeforeManifest) await this.onBeforeManifest();
 
     // Atomically update manifest.
     this.generation++;

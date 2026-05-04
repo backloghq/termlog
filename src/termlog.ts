@@ -73,12 +73,16 @@ export class TermLog {
     const backend = opts.backend ?? new FsBackend(opts.dir);
     const tokenizer = opts.tokenizer ?? DEFAULT_TOKENIZER;
 
+    // Indirection box so the onBeforeManifest callback can reference `tl` before
+    // it is constructed — the box is mutated once after construction.
+    const box = { tl: null as TermLog | null };
     const mgr = await SegmentManager.open({
       backend,
       dir: opts.dir,
       flushThreshold: opts.flushThreshold,
       mergeThreshold: opts.mergeThreshold,
       tokenizer: { kind: tokenizer.kind, minLen: 1 },
+      onBeforeManifest: () => box.tl!.saveDocIds(),
     });
 
     // When reopening an existing index, validate that the persisted tokenizer kind
@@ -90,6 +94,7 @@ export class TermLog {
     }
 
     const tl = new TermLog(mgr, tokenizer, backend, opts.k1 ?? 1.2, opts.b ?? 0.75);
+    box.tl = tl;
     await tl.loadDocIds();
     return tl;
   }
@@ -142,7 +147,6 @@ export class TermLog {
     }
 
     await this.mgr.add(numId, terms);
-    await this.saveDocIds();
   }
 
   /** Remove a document by its string docId. Idempotent. */
@@ -152,7 +156,6 @@ export class TermLog {
     await this.mgr.remove(numId);
     this.strToNum.delete(docId);
     this.numToStr.delete(numId);
-    await this.saveDocIds();
   }
 
   /**
@@ -186,7 +189,6 @@ export class TermLog {
   /** Explicitly flush the write buffer. Auto-flush still triggers on threshold. */
   async flush(): Promise<void> {
     await this.mgr.flush();
-    await this.saveDocIds();
   }
 
   /** Merge segments. */
@@ -197,6 +199,9 @@ export class TermLog {
   /** Close: flush pending writes and release the advisory lock. */
   async close(): Promise<void> {
     await this.mgr.close();
+    // Save mapping unconditionally on close — flushLocked only calls onBeforeManifest
+    // when the buffer is non-empty; an in-memory-only remove (buffer drop) would
+    // otherwise leave the mapping stale until the next flush.
     await this.saveDocIds();
   }
 
