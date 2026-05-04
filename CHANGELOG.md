@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Structured public fields on error classes: `ManifestCorruptionError.detail`, `MappingCorruptionError.detail`, `TokenizerMismatchError.persisted` / `.runtime`.
 - `ManifestVersionError` exported from `src/index.ts`.
 - NFD normalization test, remove-then-re-add same docId test, mid-compaction crash test, `VERSION` export assertion.
+- `TermLog.add()` update regression test: verifies in-place update produces no double-counted results and old content is gone.
+- `TermLog` facade-level write mutex (`serialize<R>()` promise chain) serializing `add/remove/close` — prevents TOCTOU races on `strToNum`/`numToStr` mapping under concurrent callers.
 
 ### Changed
 - `ManifestVersionError` is now thrown (instead of `ManifestCorruptionError`) when the manifest's `version` field does not match `MANIFEST_VERSION`.
@@ -29,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - README BM25 score example corrected from `0.693` to `0.655` (the idf alone is `ln(2) ≈ 0.693` but the full BM25 score is lower after length normalization).
 
 ### Fixed
+- `TermLog.add()` update-in-place data corruption: calling `add("existing-doc", …)` previously reused the numeric ID, leaving old postings in segments and causing double-counting. Now tombstones the old numId and allocates a fresh one on every update.
 - `FsBackend.writeBlob` now fsyncs the data file before rename and the parent directory after rename — ensures both file content and directory entry survive power failure.
 - Compaction first pass decoded all posting lists to collect surviving docIds (O(postings)); now uses `docLenEntries()` (O(docs), sidecar already in RAM).
 - Compaction merge pass used `decodePostings()` (full materialization per term per segment); replaced with lazy `postings()` iterator — constant per-posting memory.

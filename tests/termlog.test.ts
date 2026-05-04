@@ -132,6 +132,25 @@ describe("TermLog facade", () => {
     expect(results.map((r) => r.docId)).toContain("doc-a");
   });
 
+  it("add() on existing docId replaces content — no double-counting (#9d32ce44)", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 100 });
+    await tl.add("doc-a", "apple banana");
+    await tl.flush();
+
+    // Update in place with different content.
+    await tl.add("doc-a", "cherry dragonfruit");
+    await tl.flush();
+
+    // Old terms must not appear.
+    const appleHits = await tl.search("apple");
+    expect(appleHits.map((r) => r.docId)).not.toContain("doc-a");
+
+    // New terms must appear — and doc-a appears exactly once.
+    const cherryHits = await tl.search("cherry");
+    const docAHits = cherryHits.filter((r) => r.docId === "doc-a");
+    expect(docAHits).toHaveLength(1);
+  });
+
   it("remove-then-re-add same docId is searchable with new content (#42e94805)", async () => {
     const tl = await TermLog.open({ dir, backend, flushThreshold: 100 });
     await tl.add("doc-a", "apple banana");

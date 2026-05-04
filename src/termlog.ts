@@ -62,6 +62,14 @@ export class TermLog {
   private nextNumId = 0;
   /** Pending log lines (adds/removes) not yet flushed to docids.log. */
   private readonly pendingLog: string[] = [];
+  /** Serializes add/remove — guards strToNum/numToStr/pendingLog and coordinates with mgr. */
+  private _lock: Promise<void> = Promise.resolve();
+  private serialize<R>(fn: () => Promise<R>): Promise<R> {
+    const prev = this._lock;
+    let resolve!: () => void;
+    this._lock = new Promise<void>((r) => { resolve = r; });
+    return prev.then(fn).finally(() => resolve());
+  }
 
   private constructor(
     mgr: SegmentManager,
@@ -212,26 +220,34 @@ export class TermLog {
     for (const t of tokens) freq.set(t, (freq.get(t) ?? 0) + 1);
     const terms = [...freq.entries()].map(([term, tf]) => ({ term, tf }));
 
-    // Allocate or reuse numeric ID.
-    let numId = this.strToNum.get(docId);
-    if (numId === undefined) {
-      numId = this.nextNumId++;
+    return this.serialize(async () => {
+      const existing = this.strToNum.get(docId);
+      if (existing !== undefined) {
+        // Tombstone the old numeric ID so stale postings are dropped at compaction.
+        // A fresh numId must be allocated so old and new postings never share a docId.
+        await this.mgr.remove(existing);
+        this.numToStr.delete(existing);
+        this.pendingLog.push(JSON.stringify({ op: "rm", str: docId, num: existing }));
+      }
+
+      const numId = this.nextNumId++;
       this.strToNum.set(docId, numId);
       this.numToStr.set(numId, docId);
       this.pendingLog.push(JSON.stringify({ op: "add", str: docId, num: numId }));
-    }
-
-    await this.mgr.add(numId, terms);
+      await this.mgr.add(numId, terms);
+    });
   }
 
   /** Remove a document by its string docId. Idempotent. */
   async remove(docId: string): Promise<void> {
-    const numId = this.strToNum.get(docId);
-    if (numId === undefined) return; // not in index
-    await this.mgr.remove(numId);
-    this.strToNum.delete(docId);
-    this.numToStr.delete(numId);
-    this.pendingLog.push(JSON.stringify({ op: "rm", str: docId, num: numId }));
+    return this.serialize(async () => {
+      const numId = this.strToNum.get(docId);
+      if (numId === undefined) return; // not in index
+      await this.mgr.remove(numId);
+      this.strToNum.delete(docId);
+      this.numToStr.delete(numId);
+      this.pendingLog.push(JSON.stringify({ op: "rm", str: docId, num: numId }));
+    });
   }
 
   /**
@@ -271,10 +287,12 @@ export class TermLog {
 
   /** Close: flush pending writes and release the advisory lock. */
   async close(): Promise<void> {
-    await this.mgr.close();
-    // Snapshot on close — consolidates log into snap, removes log.
-    // Also captures in-memory-only removes that never triggered onBeforeManifest.
-    await this.snapshotDocIds();
+    return this.serialize(async () => {
+      await this.mgr.close();
+      // Snapshot on close — consolidates log into snap, removes log.
+      // Also captures in-memory-only removes that never triggered onBeforeManifest.
+      await this.snapshotDocIds();
+    });
   }
 
   /** Number of indexed documents (flushed to segments). */
