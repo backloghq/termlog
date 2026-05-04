@@ -89,7 +89,7 @@ export class SegmentWriter {
   }
 
   /**
-   * Write one term's postings. docIds MUST be in ascending order.
+   * Write one term's postings. docIds MUST be in strictly ascending order (no duplicates).
    * Terms MUST be called in lex-sorted order (strictly ascending — no duplicates).
    */
   async writeTerm(term: string, sortedDocIds: number[], sortedTfs: number[]): Promise<void> {
@@ -138,18 +138,18 @@ export class SegmentWriter {
     const postingsLen = this.postingsOffset;
 
     // --- Doc-length sidecar ---
-    // Sort by docId ascending (caller may not have added in order).
-    const pairs: Array<[number, number]> = [];
-    for (let i = 0; i < this.sidecarCount; i++) {
-      pairs.push([this.sidecarArr[i * 2], this.sidecarArr[i * 2 + 1]]);
-    }
-    pairs.sort((a, b) => a[0] - b[0]);
+    // Sort by docId ascending via an index array — avoids allocating 1M tuple objects.
+    const n = this.sidecarCount;
+    const order = new Uint32Array(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    order.sort((a, b) => this.sidecarArr[a * 2] - this.sidecarArr[b * 2]);
 
-    const sidecarBuf = Buffer.allocUnsafe(4 + pairs.length * 8);
-    sidecarBuf.writeUInt32LE(pairs.length, 0);
-    for (let i = 0; i < pairs.length; i++) {
-      sidecarBuf.writeUInt32LE(pairs[i][0], 4 + i * 8);
-      sidecarBuf.writeUInt32LE(pairs[i][1], 4 + i * 8 + 4);
+    const sidecarBuf = Buffer.allocUnsafe(4 + n * 8);
+    sidecarBuf.writeUInt32LE(n, 0);
+    for (let i = 0; i < n; i++) {
+      const src = order[i];
+      sidecarBuf.writeUInt32LE(this.sidecarArr[src * 2],     4 + i * 8);
+      sidecarBuf.writeUInt32LE(this.sidecarArr[src * 2 + 1], 4 + i * 8 + 4);
     }
     const sidecarCrc = crc32(sidecarBuf);
 
@@ -162,9 +162,8 @@ export class SegmentWriter {
     const tombstonesCrc = crc32(tombstonesBuf);
 
     // --- Term dictionary ---
-    const dictMap = new Map<string, { postingsOffset: number; postingsLength: number; df: number }>();
-    for (const e of this.dictEntries) dictMap.set(e.term, e);
-    const dict = TermDict.fromMap(dictMap);
+    // dictEntries is already in lex order (writeTerm enforces strictly ascending terms).
+    const dict = TermDict.fromSortedEntries(this.dictEntries);
     const dictBuf = dict.serialize();
     const dictCrc = crc32(dictBuf);
 
@@ -189,7 +188,7 @@ export class SegmentWriter {
     footer.writeUInt32LE(sidecarCrc,            fo); fo += 4;
     footer.writeUInt32LE(tombstonesCrc,         fo); fo += 4;
     footer.writeUInt32LE(dictCrc,               fo); fo += 4;
-    footer.writeUInt32LE(pairs.length,          fo); fo += 4;
+    footer.writeUInt32LE(n,                      fo); fo += 4;
     footer.writeUInt32LE(dict.size,             fo);
 
     // Stream remaining regions and commit.
