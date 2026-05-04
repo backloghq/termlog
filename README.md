@@ -45,14 +45,26 @@ Existing FTS engines (Lucene, Tantivy) are great but require native deps or JVM.
 ```ts
 import { TermLog } from "@backloghq/termlog";
 import { S3StorageAdapter } from "@backloghq/termlog/s3";
-import { S3Client, GetObjectCommand, PutObjectCommand,
-         DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  // Read / list / delete commands (required)
+  GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
+  // Multipart write commands (required for flush and compact)
+  CreateMultipartUploadCommand, UploadPartCommand,
+  CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+} from "@aws-sdk/client-s3";
 
 const index = await TermLog.open({
   dir: "my-index",
   backend: new S3StorageAdapter({
     client: new S3Client({ region: "us-east-1" }),
-    commands: { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command },
+    commands: {
+      // Read / list / delete
+      GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
+      // Multipart write — required; omitting any of these throws at first flush
+      CreateMultipartUploadCommand, UploadPartCommand,
+      CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+    },
     bucket: "my-bucket",
     prefix: "my-index/",  // required — scopes all keys; never use empty prefix on shared bucket
   }),

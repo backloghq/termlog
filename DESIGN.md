@@ -96,30 +96,59 @@ Atomic update: write `manifest.tmp`, fsync, rename to `manifest.json`. Reader re
 
 ## Storage backend
 
-Mirrors opslog's `StorageBackend` interface:
+`StorageBackend` is the pluggable blob storage interface:
 
 ```ts
+interface BlobWriteStream {
+  /** Stream a chunk to the destination. Not visible until end() resolves. */
+  write(chunk: Buffer): Promise<void>;
+  /** Atomically commit all chunks to the target path (fsync + rename on FS; CompleteMultipartUpload on S3). */
+  end(): Promise<void>;
+  /** Discard the in-progress write; target path remains absent. */
+  abort(): Promise<void>;
+}
+
 interface StorageBackend {
   readBlob(path: string): Promise<Buffer>;
   writeBlob(path: string, data: Buffer): Promise<void>;
   listBlobs(prefix: string): Promise<string[]>;
   deleteBlob(path: string): Promise<void>;
+  /** Open a streaming write handle. Not visible until end() commits atomically. On error, call abort(). */
+  createWriteStream(path: string): Promise<BlobWriteStream>;
+  /** Optional append (O_APPEND). Callers fall back to read-modify-write if absent. */
+  appendBlob?(path: string, data: Buffer): Promise<void>;
 }
 ```
+
+**Streaming-write crash safety:**
+- `FsBackend`: writes to a unique `<path>.<nonce>.tmp`, fsyncs data, renames over target, fsyncs directory. Concurrent calls use distinct nonces. `abort()` unlinks the tmp file.
+- `S3StorageAdapter`: uses the multipart upload protocol. Parts are buffered in memory until 5 MiB (S3 minimum), then uploaded. `end()` calls `CompleteMultipartUpload`; if Complete fails, `AbortMultipartUpload` is sent automatically before re-throwing. Zero-byte `end()` aborts the upload and falls back to `PutObject` with an empty body.
 
 `FsBackend` ships with termlog. For S3-backed indexes, use the included `S3StorageAdapter`:
 
 ```ts
 import { TermLog } from "@backloghq/termlog";
 import { S3StorageAdapter } from "@backloghq/termlog/s3";
-import { S3Client, GetObjectCommand, PutObjectCommand,
-         DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  // Read / list / delete commands (required)
+  GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
+  // Multipart write commands (required for flush and compact)
+  CreateMultipartUploadCommand, UploadPartCommand,
+  CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+} from "@aws-sdk/client-s3";
 
 const tl = await TermLog.open({
   dir: "my-index",
   backend: new S3StorageAdapter({
     client: new S3Client({ region: "us-east-1" }),
-    commands: { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command },
+    commands: {
+      // Read / list / delete
+      GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
+      // Multipart write — required; omitting any of these throws at first flush
+      CreateMultipartUploadCommand, UploadPartCommand,
+      CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
+    },
     bucket: "my-bucket",
     prefix: "my-index/",  // required — scopes all keys; never use empty prefix on shared bucket
   }),
