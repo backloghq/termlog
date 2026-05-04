@@ -111,7 +111,7 @@ describe("reader snapshot survives concurrent flush", () => {
 // ---------------------------------------------------------------------------
 describe("reader snapshot survives concurrent compaction", () => {
   it("pre-compact snapshot still queryable after compact deletes old .seg files", async () => {
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 999 });
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 999 });
     // Build 3 segments
     for (let i = 0; i < 3; i++) {
       await mgr.add(i, [{ term: "term", tf: i + 1 }]);
@@ -138,7 +138,7 @@ describe("reader snapshot survives concurrent compaction", () => {
   });
 
   it("Promise.all: concurrent reads and compact do not race", async () => {
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 999 });
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 999 });
     for (let i = 0; i < 4; i++) {
       await mgr.add(i, [{ term: "q", tf: 1 }]);
     }
@@ -156,7 +156,7 @@ describe("reader snapshot survives concurrent compaction", () => {
   });
 
   it("segments created during compaction are preserved in new snapshot", async () => {
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 999 });
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 999 });
     for (let i = 0; i < 3; i++) {
       await mgr.add(i, [{ term: "old", tf: 1 }]);
     }
@@ -182,7 +182,7 @@ describe("reader snapshot survives concurrent compaction", () => {
 // ---------------------------------------------------------------------------
 describe("manifest consistency after concurrent write+compact cycles", () => {
   it("reopen after flush+compact sees a consistent manifest (not torn)", async () => {
-    let mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 999 });
+    let mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 999 });
     for (let i = 0; i < 5; i++) {
       await mgr.add(i, [{ term: "data", tf: 1 }]);
     }
@@ -262,8 +262,8 @@ describe("AND query correctness under concurrent writes", () => {
 // ---------------------------------------------------------------------------
 describe("write mutex serialization", () => {
   it("100 concurrent add() calls all land in the manifest — no counter races or lost docs", async () => {
-    // flushThreshold=1 so every add auto-flushes; mergeThreshold=999 to disable auto-compact.
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 999 });
+    // flushThreshold=1 so every add auto-flushes; fanout=999 to disable auto-compact.
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 999 });
 
     const N = 100;
     const adds = Array.from({ length: N }, (_, i) =>
@@ -288,7 +288,7 @@ describe("write mutex serialization", () => {
   });
 
   it("Promise.all racing flush() and compact() produces a consistent manifest", async () => {
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 100, mergeThreshold: 999 });
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 100, fanout: 999 });
     // Pre-load 3 segments so compact() has work to do.
     for (let i = 0; i < 3; i++) {
       await mgr.add(i, [{ term: "x", tf: 1 }]);

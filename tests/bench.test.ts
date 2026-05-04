@@ -129,7 +129,7 @@ function runBenchmarks(): void {
     dir10k = await mkdtemp(join(tmpdir(), "termlog-bench-10k-"));
     {
       const backend = new FsBackend(dir10k);
-      const mgr = await SegmentManager.open({ backend, flushThreshold: 500, mergeThreshold: 9999 });
+      const mgr = await SegmentManager.open({ backend, flushThreshold: 500, fanout: 9999 });
       const t0 = performance.now();
       for (let i = 0; i < 10_000; i++) await mgr.add(i, termsForDoc(i));
       await mgr.flush();
@@ -142,7 +142,7 @@ function runBenchmarks(): void {
     dir100k = await mkdtemp(join(tmpdir(), "termlog-bench-100k-"));
     {
       const backend = new FsBackend(dir100k);
-      const mgr = await SegmentManager.open({ backend, flushThreshold: 1000, mergeThreshold: 9999 });
+      const mgr = await SegmentManager.open({ backend, flushThreshold: 1000, fanout: 9999 });
       const t0 = performance.now();
       for (let i = 0; i < 100_000; i++) await mgr.add(i, termsForDoc(i));
       await mgr.flush();

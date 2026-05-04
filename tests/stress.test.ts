@@ -11,7 +11,7 @@
  *
  * Assertions:
  *   1. Every flush produces a segment of at most flushThreshold docs.
- *   2. After compaction, the segment count collapses to <= mergeThreshold.
+ *   2. After compaction, the segment count collapses to <= fanout.
  *   3. All N docs are retrievable — spot-check across vocabulary and specific IDs.
  *   4. Query latency p95 <= P95_LIMIT_MS for a 10-term OR BM25 query.
  *   5. Peak RSS during indexing stays below MEM_LIMIT_MB (M8: use maxRSS, not heapUsed).
@@ -68,7 +68,7 @@ beforeAll(async () => {
   mgr = await SegmentManager.open({
     backend,
     flushThreshold: FLUSH_THRESHOLD,
-    mergeThreshold: Number.MAX_SAFE_INTEGER, // manual compact only
+    fanout: Number.MAX_SAFE_INTEGER, // manual compact only
   });
 
   for (let i = 0; i < N; i++) {

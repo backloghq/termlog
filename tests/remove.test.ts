@@ -70,7 +70,7 @@ describe("SegmentManager.remove", () => {
   });
 
   it("add 3 docs, flush, remove 1, compact, search returns 2 (physical drop)", async () => {
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 100, mergeThreshold: 100 });
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 100, fanout: 100 });
     await mgr.add(0, docTerms(["fox"]));
     await mgr.add(1, docTerms(["fox"]));
     await mgr.add(2, docTerms(["fox"]));

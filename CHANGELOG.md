@@ -7,76 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-05-04
-
 ### Added
-- `S3StorageAdapter` at `@backloghq/termlog/s3` sub-export — wraps any S3-compatible client for S3-backed indexes. Constructor warns loudly when `prefix` is empty (would scope `recoverOrphans` to the entire bucket).
-- `RawManifestEntry` internal interface — clean v1→v2 manifest upgrade without unsafe cast.
+- `S3StorageAdapter` at `@backloghq/termlog/s3` sub-export — wraps any S3-compatible client for S3-backed indexes. Constructor warns when `prefix` is empty (would scope `recoverOrphans` to the entire bucket).
 - `readonly SegmentReader[]` return type on `segments()` — signals callers must not mutate the snapshot.
 - Source maps and declaration maps (`sourceMap: true`, `declarationMap: true` in tsconfig).
 - `"sideEffects": false` in package.json for bundler tree-shaking.
-
-### Changed
-- **Compaction no longer renumbers docIds** — original numIds are preserved through merge. Previously, densification broke `TermLog.numToStr` lookups (returned dense IDs that didn't match the original numId map) and broke tombstone matching for tier-1+ segments (tombstones store original numIds). The segment format already supported sparse uint32 docIds natively.
-- **Unresolved tombstones are carried forward** — when a merged segment holds a tombstone targeting a doc in an unmerged segment, the tombstone is now written to the merged output. Previously it was silently dropped, resurrecting the deleted doc in subsequent queries.
-- `compact()` now snapshots docIds after merge to bound `docids.log` growth on long-running servers.
-- Missing segment files referenced by the manifest now throw `SegmentCorruptionError(region="footer")` instead of a raw `ENOENT`.
-- `BM25Ranker` tie-break is now numeric (`a.docId - b.docId`) instead of `String(docId)` comparison — avoids two string allocations per heap comparison.
-- `SegmentReader` sidecar storage replaced from `Map<number,number>` to interleaved `Uint32Array[2N]` with binary search — avoids 1M+ Map slot heap for large merged segments.
-- `DEFAULT_MERGE_THRESHOLD = 8` constant removed — was set but never read (only `tieredFanout` is consulted). `mergeThreshold` option in `SegmentManagerOpts` is kept as a backward-compat alias for `fanout`.
-- `postingIterator` return type widened to `Iterator<Posting, undefined>` — removes `undefined as unknown as Posting` cast.
-- Dead manifest temp-file cleanup in `loadManifest` removed — `recoverOrphans()` already handles this.
-- `repository.url` in package.json fixed to `git+https://` form.
-
-### Fixed
-- `TermLog.search` returning wrong string docId after compaction (post-densification localId didn't match original numId in `numToStr`).
-- Tombstoned docs resurrecting after partial compaction when tombstone lived in a merged segment targeting a doc in an unmerged segment.
-- Incorrect comment in `codec.ts` claiming VByte supports "up to 2^35-1" — actual limit is 2^49-1 (7 bytes).
-- CHANGELOG entry referencing nonexistent `docIds.docCount` property — corrected to `SegmentReader.docCount`.
-
-### Added
-
-(Original [Unreleased] items from previous iteration follow:)
-- **Size-tiered compaction** (`#14614fcf`): segments now carry a `tier` field. After each flush, `chooseCompactionTargets()` picks the lowest tier with `>= fanout` segments and merges exactly `fanout` of them into a new segment at `tier + 1`. This cascades until no tier is eligible. Write amplification is `O(N log_{fanout} N)` — each doc is rewritten at most `log_4(256)=4` times for N=256 with the default fanout=4. Manual `compact()` merges everything into one segment (`maxTier + 1`), unchanged semantics for callers that call it explicitly.
-- `fanout` option on `SegmentManagerOpts` and `TermLogOptions` — configures the size-tiered compaction fanout (default 4). `mergeThreshold` is kept as a backward-compat alias.
+- **Size-tiered compaction**: segments carry a `tier` field. After each flush, `chooseCompactionTargets()` picks the lowest tier with `>= fanout` segments and merges exactly `fanout` of them into a new segment at `tier + 1`. This cascades until no tier is eligible. Write amplification is `O(N log_{fanout} N)`. Manual `compact()` merges everything into one segment (`maxTier + 1`).
+- `fanout` option on `SegmentManagerOpts` and `TermLogOptions` — configures the size-tiered compaction fanout (default 4).
 - `ManifestSegmentEntry.tier` field — per-segment compaction tier stored in the manifest.
-- Manifest v2 format adds `tier` to each segment entry. v1 manifests (no `tier`) are transparently upgraded on open: all segments assigned `tier: 0`. The first write after open emits a v2 manifest.
-- `ManifestVersionError` now validates `version <= MANIFEST_VERSION` (was `=== 1`); accepts both v1 and v2.
-- `SegmentReader.docCount` property — number of docs in the segment's sidecar, used for per-segment offset computation during merge.
-- Tiered compaction test suite: cascade promotion (tier-0 → tier-1 → tier-2), all docs recoverable after multi-tier promotion, v1 manifest upgrade (tier=0 assigned, cascade fires correctly), manual `compact()` correctness and persistence across reopen, configurable fanout (fanout=2, fanout=8, mergeThreshold as fanout alias), write-amplification bound assertions (O(N log N) verified at N=256).
+- `SegmentReader.docCount` property — number of docs in the segment's sidecar.
+- Tiered compaction test suite: cascade promotion, all docs recoverable after multi-tier promotion, manual `compact()` correctness and persistence across reopen, configurable fanout, write-amplification bound assertions.
 - `QueryPosting.segIndex` — index of the segment owning each result docId, enabling O(1) docLen lookup in `BM25Ranker.score()`.
-- `MultiSegmentIter` rewritten to use `MinHeap<HeapSlot>` — `currentDocId` peek is O(1), seek rebuilds the heap in O(K log K) instead of O(K²).
+- `MultiSegmentIter` rewritten to use `MinHeap<HeapSlot>` — `currentDocId` peek is O(1), seek rebuilds the heap in O(K log K).
 - `SegmentReader.docLenEntries()` — exposes the sidecar's `(docId, length)` pairs for compaction without decoding posting lists.
-- Docids append-only journal: `docids.log` (JSONL delta log of add/rm entries) replaces full-rewrite `docids.json` on each flush; `docids.snap` (full snapshot) written on close. Load path: snap → log replay → legacy `docids.json` fallback for backward compatibility.
-- Three journal tests: log written after flush, log replay on crash-reopen (lock deleted to simulate crash), remove entries appear in log.
-- `ManifestVersionError` class — dedicated error for unsupported manifest version, with `found` and `expected` fields (previously a generic `ManifestCorruptionError`).
-- `DEFAULT_FLUSH_THRESHOLD` exported named constant (1000); previously a magic literal.
-- `VERSION` constant now sourced from `package.json` at build time via JSON import attribute; no longer a manually maintained literal.
-- `@internal` JSDoc tags on all low-level exports (codec, term-dict, segment, manager internals, query, scoring) so api-extractor can strip them from the public API surface.
+- Docids append-only journal: `docids.log` (JSONL delta log of add/rm entries) replaces full-rewrite `docids.json` on each flush; `docids.snap` (full snapshot) written on close. Load path: snap → log replay.
+- Three journal tests: log written after flush, log replay on crash-reopen, remove entries appear in log.
+- `ManifestVersionError` class — dedicated error for unsupported manifest version, with `found` and `expected` fields.
+- `DEFAULT_FLUSH_THRESHOLD` exported named constant (1000).
+- `VERSION` constant sourced from `package.json` at build time via JSON import attribute.
+- `@internal` JSDoc tags on all low-level exports so api-extractor can strip them from the public API surface.
 - Structured public fields on error classes: `ManifestCorruptionError.detail`, `MappingCorruptionError.detail`, `TokenizerMismatchError.persisted` / `.runtime`.
 - `ManifestVersionError` exported from `src/index.ts`.
 - NFD normalization test, remove-then-re-add same docId test, mid-compaction crash test, `VERSION` export assertion.
-- Top-k heap in `BM25Ranker.score()` when `limit` is set: uses `MinHeap<ScoredDoc>` keyed by `(score asc, docId desc)` — O(hits × log(limit)) instead of O(hits × log(hits)). Reduces 1M-doc, 10-term OR query from >500ms → p50=271ms, p95=288ms on Ryzen 9700X. No-limit path unchanged (collects all hits, then sorts).
-- `StorageBackend.appendBlob?(path, data)` optional method — crash-safe O(1) append for backends that support it; callers fall back to read-modify-write automatically.
-- `FsBackend.appendBlob` — opens `O_APPEND|O_CREAT`, writes chunk, fsyncs; true kernel-level append for `docids.log` on local FS.
-- `S3StorageAdapter` in new sub-export `@backloghq/termlog/s3` — wraps any S3-compatible client (AWS SDK v3, R2, MinIO) via injected command constructors; zero hard SDK dependency. `appendBlob` intentionally absent (S3 has no native append; docids falls back to snapshot mode).
+- Top-k heap in `BM25Ranker.score()` when `limit` is set: uses `MinHeap<ScoredDoc>` keyed by `(score asc, docId desc)` — O(hits × log(limit)) instead of O(hits × log(hits)).
+- `StorageBackend.appendBlob?(path, data)` optional method — crash-safe O(1) append for backends that support it.
+- `FsBackend.appendBlob` — opens `O_APPEND|O_CREAT`, writes chunk, fsyncs.
 - `termlog/s3` entry added to `package.json` exports map.
-- `TermLog.add()` update regression test: verifies in-place update produces no double-counted results and old content is gone.
-- `TermLog` facade-level write mutex (`serialize<R>()` promise chain) serializing `add/remove/close` — prevents TOCTOU races on `strToNum`/`numToStr` mapping under concurrent callers.
+- `TermLog.add()` update regression test: verifies in-place update produces no double-counted results.
+- `TermLog` facade-level write mutex (`serialize<R>()` promise chain) serializing `add/remove/close`.
+- `compact()` now snapshots docIds after merge to bound `docids.log` growth.
+- Missing segment files referenced by the manifest now throw `SegmentCorruptionError(region="footer")`.
+- TermLog facade round-trip test: docId string→number→string round-trip survives compact.
+- Tombstone carry-forward test: tombstone for doc in unmerged segment survives compaction.
+- Multi-process lockfile contention tests.
+- Mid-compaction orphan cleanup test.
 
 ### Changed
-- `ManifestVersionError` is now thrown (instead of `ManifestCorruptionError`) when the manifest's `version` field does not match `MANIFEST_VERSION`.
-- `BM25Ranker` class-level and `score()` JSDoc updated to document the `mode` parameter and AND semantics.
-- `TermLog` module-level JSDoc updated to describe the docids journal/snapshot pattern (replaces stale `docids.json` reference).
+- **Compaction no longer renumbers docIds** — original numIds are preserved through merge. The segment format supports sparse uint32 docIds natively. Previously, densification broke `TermLog.numToStr` lookups and tombstone matching for tier-1+ segments.
+- **Unresolved tombstones are carried forward** — when a merged segment holds a tombstone targeting a doc in an unmerged segment, the tombstone is written to the merged output. Previously it was silently dropped, resurrecting the deleted doc in subsequent queries.
+- Manifest requires exactly version 2 — any other version throws `ManifestVersionError`. The index only ever writes v2; v1 is not accepted.
+- `BM25Ranker` tie-break is now numeric (`a.docId - b.docId`) instead of string comparison.
+- `SegmentReader` sidecar storage replaced from `Map<number,number>` to interleaved `Uint32Array[2N]` with binary search.
+- `DEFAULT_MERGE_THRESHOLD` constant removed.
+- `postingIterator` return type widened to `Iterator<Posting, undefined>`.
+- Dead manifest temp-file cleanup in `loadManifest` removed — `recoverOrphans()` already handles this.
+- `repository.url` in package.json fixed to `git+https://` form.
+- `ManifestVersionError` thrown (instead of `ManifestCorruptionError`) when manifest `version` does not match `MANIFEST_VERSION`.
+- `BM25Ranker` class-level and `score()` JSDoc updated to document the `mode` parameter.
+- `TermLog` module-level JSDoc updated to describe the docids journal/snapshot pattern.
 - `StorageBackend` module doc no longer claims to mirror opslog's interface.
-- README BM25 score example corrected from `0.693` to `0.655` (the idf alone is `ln(2) ≈ 0.693` but the full BM25 score is lower after length normalization).
 
 ### Fixed
-- `TermLog.add()` update-in-place data corruption: calling `add("existing-doc", …)` previously reused the numeric ID, leaving old postings in segments and causing double-counting. Now tombstones the old numId and allocates a fresh one on every update.
-- `FsBackend.writeBlob` now fsyncs the data file before rename and the parent directory after rename — ensures both file content and directory entry survive power failure.
-- Compaction first pass decoded all posting lists to collect surviving docIds (O(postings)); now uses `docLenEntries()` (O(docs), sidecar already in RAM).
-- Compaction merge pass used `decodePostings()` (full materialization per term per segment); replaced with lazy `postings()` iterator — constant per-posting memory.
-- `docids.json` full-rewrite on every flush was O(N) for N=total mapped docs; replaced by O(delta) log append — sub-millisecond for any delta size.
+- `TermLog.search` returning wrong string docId after compaction.
+- Tombstoned docs resurrecting after partial compaction.
+- Incorrect comment in `codec.ts` claiming VByte supports "up to 2^35-1" — actual limit is 2^49-1 (7 bytes).
+- `TermLog.add()` update-in-place data corruption: calling `add("existing-doc", …)` previously reused the numeric ID. Now tombstones the old numId and allocates a fresh one on every update.
+- `FsBackend.writeBlob` now fsyncs the data file before rename and the parent directory after rename.
+- Compaction first pass now uses `docLenEntries()` (O(docs)) instead of decoding all posting lists (O(postings)).
+- Compaction merge pass uses lazy `postings()` iterator instead of `decodePostings()` full materialization.
+- `docids.json` full-rewrite on every flush was O(N); replaced by O(delta) log append.
+- README BM25 score example corrected from `0.693` to `0.655`.
 
 ## [0.1.0] - 2026-05-04
 
@@ -87,22 +77,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - **StorageBackend abstraction (`src/storage.ts`)** — `StorageBackend` interface (`readBlob`, `writeBlob`, `listBlobs`, `deleteBlob`, optional `isLocalFs`); `FsBackend` implementation with atomic writes (`.tmp` + rename), prefix-filtered `listBlobs` (root-flat, no recursive walk), idempotent `deleteBlob`, recursive directory creation. 12 tests: round-trip, atomic write (no stale `.tmp`), overwrite, missing-file errors, prefix filtering, empty-dir and no-match list, delete idempotency, nested dirs, interface compat (FsBackend + mock S3-shape backend).
 - **Lint script extended to cover `tests/`** — `eslint src/ tests/`.
 - **Segment writer + reader (`src/segment.ts`, `src/crc32.ts`)** — `SegmentWriter` accumulates `addPosting`/`setDocLength`/`setTombstones` calls, sorts by term and doc ID, then `flush(id, backend)` writes a single binary `.seg` file atomically. `SegmentReader.open` verifies CRC32 for all four regions (postings, sidecar, tombstones, dict), throws `SegmentCorruptionError` naming the corrupted region on mismatch, and exposes `lookupTerm`, `postings` (lazy iterator), `decodePostings` (full materialization), `docLen`, `terms` (sorted generator), `tombstones` (Uint32Array), `isTombstoned` (binary search). Segment v2 format (64-byte footer): tombstones region between sidecar and dict (`uint32 count | uint32[] sorted docIds`, CRC32 verified). Pure-JS CRC32 in `src/crc32.ts` (IEEE 802.3 polynomial, table-driven).
-- **SegmentManager + manifest (`src/manager.ts`)** — `SegmentManager` class with write buffer, auto-flush at configurable threshold, atomic manifest (`manifest.tmp` → rename), and reader snapshot isolation. `SegmentManager.open` reads an existing manifest and reopens all referenced `SegmentReader`s. `add(docId, terms[])` buffers docs; `flush()` writes a new segment via `SegmentWriter`, increments the monotonic `generation` counter, and replaces the reader snapshot immutably so callers holding a prior snapshot are unaffected. `remove(docId)` drops from buffer or queues a tombstone. `segments()` returns the current immutable snapshot; `commitGeneration()` returns the monotonic counter. Manifest format: `{ version, generation, segments[], tokenizer, totalDocs, totalLen }`. Write mutex via `serialize<R>()` promise-chain pattern (mirrors opslog) serializes `add/flush/compact/remove`; reads remain lock-free. Advisory lockfile via O_EXCL open; `IndexLockedError` on live-process conflict; stale-pid auto-claim; `close()` releases lock. `onBeforeManifest` hook called after segment write, before manifest commit (used by TermLog to keep docids.json consistent). After compaction, `totalDocs`/`totalLen` are derived from the new segment list rather than the running counter so tombstoned docs are reflected immediately. `loadManifest` re-throws non-ENOENT errors (EACCES, EIO, S3 5xx). `recoverOrphans` uses prefix-scoped list calls (`listBlobs("seg-")` + `listBlobs("manifest")`) to avoid full-bucket scans on S3.
-- **Compaction — streaming k-way merge (`src/heap.ts`)** — `MinHeap<T>` binary min-heap; `compact()` uses two-pass streaming: first pass collects surviving docIds (O(unique surviving docs)), second pass heap-driven merge streams term-by-term (O(K) heap entries + O(largest posting list) accumulator) instead of materializing `Map<term, Map<docId, tf>>`. Tombstoned docIds are physically dropped during compaction.
-- **Query iterators + boolean ops (`src/query.ts`)** — `SegmentPostingIter` wraps a single segment's lazy posting iterator with `advance()` and `seek(docId)`. `MultiSegmentIter` k-way merges per-segment iters for one term in docId order, filtering tombstoned docIds. `buildTombstoneSet(segments)` builds union set for query filtering. `andQuery` (zigzag merge) yields only docIds present in all term iterators; `orQuery` (k-way union) yields every docId in any term iterator with per-term tfs collected.
-- **BM25 scoring layer (`src/scoring.ts`)** — `bm25Score(tf, dl, df, N, k1, b, avgdl)` pure function; `BM25Ranker` wraps `andQuery` or `orQuery` (configurable via `mode` param) and emits `{docId, score}` sorted score-desc, tie-broken by string-lexicographic docId asc. `BM25Ranker.score()` accepts `mode: "and" | "or"` parameter (default "or").
-- **TermLog facade (`src/termlog.ts`)** — `TermLog.open/add/remove/search/flush/compact/close` with string↔number docId mapping (persisted in `docids.json` before manifest commit via `onBeforeManifest` hook), automatic tokenization, BM25 search. `search()` forwards `mode: "and" | "or"` to `BM25Ranker`. `MappingCorruptionError` on corrupt `docids.json`. Mapping saved only on flush (via hook) and unconditionally on `close()`.
-- **Tokenizer abstraction (`src/tokenizer.ts`)** — `Tokenizer` interface with `kind: string` and optional `minLen?: number`; `UnicodeTokenizer` matching agentdb's `/[\p{L}\p{M}\p{N}]+/gu` regex; `DEFAULT_TOKENIZER`. Tokenizer kind and minLen persisted in manifest; `TokenizerMismatchError` thrown on reopen with different kind.
-- **Full public surface exported from `src/index.ts`** — all classes, functions, and types.
-- **Crash recovery (`src/manager.ts`, `tests/crash-recovery.test.ts`)** — `SegmentManager.open` handles all 5 failure modes: orphan `.seg.tmp` cleanup, orphan `.seg` cleanup, stale `manifest.tmp` deletion, CRC corruption propagated as `SegmentCorruptionError`, manifest JSON parse failure throws `ManifestCorruptionError`.
-- **Concurrency tests (`tests/concurrency.test.ts`)** — reader-snapshot isolation, 100 concurrent adds, racing flush+compact, racing add+remove (write mutex verification).
-- **Test gaps (`tests/gaps.test.ts`)** — CRC32 known-vectors, decodeVByte edge cases, segment version mismatch, sidecar CRC corruption, tombstone region CRC corruption, concurrent writeBlob race (nonce isolation), UnicodeTokenizer parity, tokenizer kind round-trip, `TokenizerMismatchError`, custom tokenizer round-trip.
-- **Heap unit tests (`tests/heap.test.ts`)** — 7 tests: empty, single, ascending order, duplicates, object comparison, interleaved push/pop, size tracking.
+- **SegmentManager + manifest (`src/manager.ts`)** — `SegmentManager` class with write buffer, auto-flush at configurable threshold, atomic manifest (`manifest.tmp` → rename), and reader snapshot isolation. `SegmentManager.open` reads an existing manifest and reopens all referenced `SegmentReader`s. `add(docId, terms[])` buffers docs; `flush()` writes a new segment via `SegmentWriter`, increments the monotonic `generation` counter, and replaces the reader snapshot immutably so callers holding a prior snapshot are unaffected. `remove(docId)` drops from buffer or queues a tombstone. `segments()` returns the current immutable snapshot; `commitGeneration()` returns the monotonic counter. Manifest format: `{ version, generation, segments[], tokenizer, totalDocs, totalLen }`. Write mutex via `serialize<R>()` promise-chain pattern serializes `add/flush/compact/remove`; reads remain lock-free. Advisory lockfile via O_EXCL open; `IndexLockedError` on live-process conflict; stale-pid auto-claim; `close()` releases lock. `onBeforeManifest` hook called after segment write, before manifest commit. After compaction, `totalDocs`/`totalLen` derived from segment list rather than running counter. `loadManifest` re-throws non-ENOENT errors. `recoverOrphans` uses prefix-scoped list calls to avoid full-bucket scans on S3.
+- **Compaction — streaming k-way merge (`src/heap.ts`)** — `MinHeap<T>` binary min-heap; `compact()` uses two-pass streaming: first pass collects surviving docIds (O(unique surviving docs)), second pass heap-driven merge streams term-by-term (O(K) heap entries + O(largest posting list) accumulator).
+- **Query iterators + boolean ops (`src/query.ts`)** — `SegmentPostingIter`, `MultiSegmentIter`, `buildTombstoneSet`, `andQuery` (zigzag merge), `orQuery` (k-way union).
+- **BM25 scoring layer (`src/scoring.ts`)** — `bm25Score` pure function; `BM25Ranker` wraps `andQuery` or `orQuery` and emits `{docId, score}` sorted score-desc, tie-broken by numeric docId ascending.
+- **TermLog facade (`src/termlog.ts`)** — `TermLog.open/add/remove/search/flush/compact/close` with string↔number docId mapping persisted in `docids.snap`/`docids.log`, automatic tokenization, BM25 search.
+- **Tokenizer abstraction (`src/tokenizer.ts`)** — `Tokenizer` interface; `UnicodeTokenizer`; `DEFAULT_TOKENIZER`. Tokenizer kind and minLen persisted in manifest; `TokenizerMismatchError` thrown on reopen with different kind.
+- **Full public surface exported from `src/index.ts`**.
+- **Crash recovery (`src/manager.ts`, `tests/crash-recovery.test.ts`)** — handles orphan `.seg.tmp` cleanup, orphan `.seg` cleanup, stale `manifest.tmp` deletion, CRC corruption, manifest JSON parse failure.
+- **Concurrency tests (`tests/concurrency.test.ts`)** — reader-snapshot isolation, 100 concurrent adds, racing flush+compact, racing add+remove.
+- **Test gaps (`tests/gaps.test.ts`)** — CRC32 known-vectors, decodeVByte edge cases, segment version mismatch, sidecar CRC corruption, tombstone region CRC corruption, concurrent writeBlob race, UnicodeTokenizer parity, tokenizer kind round-trip, `TokenizerMismatchError`, custom tokenizer round-trip.
+- **Heap unit tests (`tests/heap.test.ts`)**.
 - **Stress test (`tests/stress.test.ts`)** — gated behind `STRESS=1`; defaults to 10k docs in normal CI.
 - **Benchmark suite (`tests/bench.test.ts`)** — gated behind `BENCH=1`; skips gracefully otherwise.
 
 ### Fixed
-- `SegmentWriter.flush()` was double-writing the segment file; now writes directly once via `FsBackend.writeBlob`.
+- `SegmentWriter.flush()` was double-writing the segment file.
 - `loadManifest` caught all errors and silently treated them as fresh-index; now re-throws non-ENOENT errors.
 - `recoverOrphans` used `listBlobs("")` (full-bucket scan on S3); now uses prefix-scoped calls.
 - `totalDocs`/`totalLen` not decremented on tombstone compaction; now derived from segment list post-compaction.
@@ -110,4 +100,4 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - `docids.json` written on every `add()`/`remove()` (write amplification); now persisted only on flush and close.
 - `mode: "and"` parameter in `TermLog.search()` was dead code; wired to `andQuery` via `BM25Ranker.score()`.
 - `UnicodeTokenizer.minLen` hardcoded as 1 in manifest; now read from the tokenizer instance.
-- BM25 parity tests used a cross-repo import of `agentdb/dist/text-index.js`; replaced with a self-contained hand-coded reference implementation.
+- BM25 parity tests replaced cross-repo import with self-contained reference implementation.

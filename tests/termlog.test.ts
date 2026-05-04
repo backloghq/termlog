@@ -30,7 +30,7 @@ afterEach(async () => {
 describe("VERSION export (#59ac681f)", () => {
   it("VERSION matches package.json version string", () => {
     expect(VERSION).toMatch(/^\d+\.\d+\.\d+/);
-    expect(VERSION).toBe("0.2.0");
+    expect(VERSION).toBe("0.1.0");
   });
 });
 

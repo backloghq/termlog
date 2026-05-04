@@ -44,8 +44,6 @@ export interface TermLogOptions {
   flushThreshold?: number;
   /** Size-tiered compaction fanout — how many same-tier segments trigger a merge. Default 4. */
   fanout?: number;
-  /** Backward compat alias for `fanout`. Ignored when `fanout` is set. */
-  mergeThreshold?: number;
   k1?: number;
   b?: number;
 }
@@ -100,7 +98,6 @@ export class TermLog {
       dir: opts.dir,
       flushThreshold: opts.flushThreshold,
       fanout: opts.fanout,
-      mergeThreshold: opts.mergeThreshold,
       tokenizer: { kind: tokenizer.kind, minLen: tokenizer.minLen ?? 1 },
       onBeforeManifest: () => box.tl!.saveDocIds(),
     });
@@ -129,17 +126,11 @@ export class TermLog {
   }
 
   private async loadDocIds(): Promise<void> {
-    // Load snapshot (new format). Fall back to legacy docids.json if no snap exists.
     let snapRaw: Buffer | null = null;
     try {
       snapRaw = await this.backend.readBlob(DOCIDS_SNAP);
     } catch {
-      // No snap — try legacy file for backward compatibility.
-      try {
-        snapRaw = await this.backend.readBlob("docids.json");
-      } catch {
-        // Fresh index.
-      }
+      // No snap — fresh index.
     }
 
     if (snapRaw !== null) {

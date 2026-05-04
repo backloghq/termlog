@@ -2,11 +2,8 @@
  * SegmentManager — coordinates write buffer, segment flush, manifest, and compaction.
  *
  * Manifest format (manifest.json):
- *   v1: { version: 1, generation: N, segments: [{id, docCount, totalLen}],
- *          tokenizer: {kind, minLen}, totalDocs, totalLen }
- *   v2: { version: 2, generation: N, segments: [{id, docCount, totalLen, tier}],
- *          tokenizer: {kind, minLen}, totalDocs, totalLen }
- *   v1 manifests are transparently upgraded to v2 on open (all segments get tier=0).
+ *   { version: 2, generation: N, segments: [{id, docCount, totalLen, tier}],
+ *     tokenizer: {kind, minLen}, totalDocs, totalLen }
  *
  * Manifest is updated atomically: write manifest.tmp → rename to manifest.json.
  * Readers call `segments()` to get an immutable snapshot of the current reader list;
@@ -37,14 +34,6 @@ export interface ManifestSegmentEntry {
   tier: number;
 }
 
-/** Raw on-disk segment entry — `tier` is optional because v1 manifests omit it. */
-interface RawManifestEntry {
-  id: string;
-  docCount: number;
-  totalLen: number;
-  tier?: number;
-}
-
 export interface TokenizerConfig {
   kind: string;
   minLen: number;
@@ -53,7 +42,7 @@ export interface TokenizerConfig {
 interface Manifest {
   version: number;
   generation: number;
-  segments: RawManifestEntry[];
+  segments: ManifestSegmentEntry[];
   tokenizer: TokenizerConfig;
   totalDocs: number;
   totalLen: number;
@@ -67,7 +56,6 @@ interface BufferedDoc {
 }
 
 const MANIFEST_VERSION = 2;
-const MANIFEST_MIN_SUPPORTED = 1;
 const MANIFEST_FILE = "manifest.json";
 const LOCK_FILE = ".lock";
 export const DEFAULT_FLUSH_THRESHOLD = 1000;
@@ -81,13 +69,13 @@ export class ManifestCorruptionError extends Error {
   }
 }
 
-/** Thrown when the manifest's `version` field is outside the range this code supports. */
+/** Thrown when manifest.json has a version other than MANIFEST_VERSION. */
 export class ManifestVersionError extends Error {
   constructor(
     public readonly found: number,
     public readonly expected: number,
   ) {
-    super(`Unsupported manifest version ${found} (expected <= ${expected})`);
+    super(`Unsupported manifest version ${found} (expected ${expected})`);
     this.name = "ManifestVersionError";
   }
 }
@@ -106,11 +94,6 @@ export interface SegmentManagerOpts {
   dir?: string;
   /** How many buffered docs trigger an automatic flush. Default: 1000. */
   flushThreshold?: number;
-  /**
-   * Backward compat alias for `fanout`. Ignored when `fanout` is set.
-   * Kept so existing callers that pass `mergeThreshold` continue to work.
-   */
-  mergeThreshold?: number;
   /**
    * How many same-tier segments trigger a tier merge (size-tiered compaction).
    * Default: 4.
@@ -178,7 +161,7 @@ export class SegmentManager {
   }
 
   static async open(opts: SegmentManagerOpts): Promise<SegmentManager> {
-    const effectiveFanout = opts.fanout ?? opts.mergeThreshold ?? DEFAULT_FANOUT;
+    const effectiveFanout = opts.fanout ?? DEFAULT_FANOUT;
     const mgr = new SegmentManager(
       opts.backend,
       opts.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD,
@@ -266,7 +249,7 @@ export class SegmentManager {
       throw new ManifestCorruptionError(String(err));
     }
 
-    if (manifest.version < MANIFEST_MIN_SUPPORTED || manifest.version > MANIFEST_VERSION) {
+    if (manifest.version !== MANIFEST_VERSION) {
       throw new ManifestVersionError(manifest.version, MANIFEST_VERSION);
     }
 
@@ -274,11 +257,7 @@ export class SegmentManager {
     this._persistedTokenizerKind = manifest.tokenizer.kind;
     this._persistedTokenizerMinLen = manifest.tokenizer.minLen;
     this.generation = manifest.generation;
-    // v1 → v2 upgrade: assign tier=0 to all segments (they were never tiered).
-    this.manifestSegments = manifest.segments.map((e) => ({
-      ...e,
-      tier: e.tier ?? 0,
-    }));
+    this.manifestSegments = manifest.segments;
     this.totalDocs = manifest.totalDocs;
     this.totalLen = manifest.totalLen;
     this.nextSegCounter = manifest.generation + 1;

@@ -1,6 +1,6 @@
 {
   "name": "@backloghq/termlog",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

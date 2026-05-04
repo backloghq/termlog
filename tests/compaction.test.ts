@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SegmentManager } from "../src/manager.js";
@@ -18,8 +18,8 @@ afterEach(async () => {
 });
 
 /** Build an index with n docs, one segment per doc (flushThreshold=1). */
-async function buildIndex(n: number, mergeThreshold = 999): Promise<SegmentManager> {
-  const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold });
+async function buildIndex(n: number, fanout = 999): Promise<SegmentManager> {
+  const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout });
   for (let i = 0; i < n; i++) {
     await mgr.add(i, [{ term: "common", tf: 1 }, { term: `doc${i}`, tf: 2 }]);
   }
@@ -206,10 +206,10 @@ describe("compact — reader snapshot isolation", () => {
   });
 });
 
-describe("compact — auto-trigger via mergeThreshold", () => {
-  it("auto-compacts when segment count reaches mergeThreshold", async () => {
-    // flushThreshold=1 means each add() flushes; mergeThreshold=3 triggers compact after 3 segments.
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 3 });
+describe("compact — auto-trigger via fanout", () => {
+  it("auto-compacts when segment count reaches fanout", async () => {
+    // flushThreshold=1 means each add() flushes; fanout=3 triggers compact after 3 segments.
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 3 });
     await mgr.add(0, [{ term: "a", tf: 1 }]);
     await mgr.add(1, [{ term: "b", tf: 1 }]);
     expect(mgr.segments()).toHaveLength(2); // no compact yet
@@ -298,73 +298,6 @@ describe("tiered compaction — cascade", () => {
   });
 });
 
-describe("tiered compaction — v1 manifest upgrade", () => {
-  it("v1 manifest loads with tier=0 on all segments", async () => {
-    // Write a v1 manifest directly (no tier field).
-    const v1Manifest = JSON.stringify({
-      version: 1,
-      generation: 2,
-      segments: [
-        { id: "seg-000000", docCount: 1, totalLen: 5 },
-        { id: "seg-000001", docCount: 1, totalLen: 3 },
-      ],
-      tokenizer: { kind: "unicode", minLen: 1 },
-      totalDocs: 2,
-      totalLen: 8,
-    });
-    // Write two minimal segment files so SegmentReader.open doesn't throw.
-    // We open a fresh manager just to flush two real segments, then overwrite manifest.
-    const mgr0 = await SegmentManager.open({ backend, flushThreshold: 1 });
-    await mgr0.add(0, [{ term: "a", tf: 5 }]);
-    await mgr0.add(1, [{ term: "b", tf: 3 }]);
-    await mgr0.close();
-
-    // Overwrite manifest with v1 format.
-    await writeFile(join(dir, "manifest.json"), v1Manifest, "utf-8");
-
-    // Reopen — should succeed and upgrade transparently.
-    const mgr = await SegmentManager.open({ backend });
-    expect(mgr.segments()).toHaveLength(2);
-    expect(mgr.commitGeneration()).toBe(2);
-
-    // After any operation that writes a new manifest (flush), it should be v2.
-    await mgr.add(2, [{ term: "c", tf: 1 }]);
-    await mgr.flush();
-
-    const raw = await backend.readBlob("manifest.json");
-    const m = JSON.parse(raw.toString("utf8")) as { version: number; segments: Array<{ tier?: number }> };
-    expect(m.version).toBe(2);
-    // All original segments now have tier field.
-    expect(m.segments.every((s) => typeof s.tier === "number")).toBe(true);
-    await mgr.close();
-  });
-
-  it("v1 manifest: auto-cascade uses tier=0 for v1 segments", async () => {
-    // Write a v1 manifest with 3 segments, then open with fanout=3 and add 1 more doc.
-    // Reopen will see 3 tier-0 segments; adding 1 more flushes → 4 tier-0 → cascade fires.
-    const mgr0 = await SegmentManager.open({ backend, flushThreshold: 1 });
-    await mgr0.add(0, [{ term: "a", tf: 1 }]);
-    await mgr0.add(1, [{ term: "b", tf: 1 }]);
-    await mgr0.add(2, [{ term: "c", tf: 1 }]);
-    await mgr0.close();
-
-    // Re-write manifest as v1 (strip tier fields).
-    const raw = await backend.readBlob("manifest.json");
-    const m = JSON.parse(raw.toString("utf8")) as { version: number; segments: Array<Record<string, unknown>> };
-    m.version = 1;
-    m.segments = m.segments.map((s) => { const { tier: _t, ...rest } = s; void _t; return rest; });
-    await writeFile(join(dir, "manifest.json"), JSON.stringify(m), "utf-8");
-
-    // Reopen with fanout=3; v1 segments get tier=0.
-    const mgr = await SegmentManager.open({ backend, dir, flushThreshold: 1, fanout: 3 });
-    expect(mgr.segments()).toHaveLength(3);
-
-    // Add a 4th doc → flush → 4 tier-0 → but fanout=3 so first 3 merge → 1 tier-1 + 1 tier-0.
-    await mgr.add(3, [{ term: "d", tf: 1 }]);
-    expect(mgr.segments()).toHaveLength(2);
-    await mgr.close();
-  });
-});
 
 describe("tiered compaction — manual compact()", () => {
   it("manual compact merges everything into one segment", async () => {
@@ -433,16 +366,6 @@ describe("tiered compaction — configurable fanout", () => {
     expect(mgr8.segments()).toHaveLength(1);
   });
 
-  it("mergeThreshold used as fanout when fanout not set", async () => {
-    // mergeThreshold=3 should behave like fanout=3
-    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 3 });
-    await mgr.add(0, [{ term: "a", tf: 1 }]);
-    await mgr.add(1, [{ term: "b", tf: 1 }]);
-    expect(mgr.segments()).toHaveLength(2); // 2 < 3, no merge
-    await mgr.add(2, [{ term: "c", tf: 1 }]);
-    // 3 >= fanout=3, merge fires.
-    expect(mgr.segments()).toHaveLength(1);
-  });
 });
 
 describe("tiered compaction — write amplification", () => {

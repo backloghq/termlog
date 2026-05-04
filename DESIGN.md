@@ -64,7 +64,7 @@ Size-tiered LSM merge:
 - During merge, original doc IDs are preserved — the segment format supports sparse uint32 docIds natively. Old segments are deleted only after the merged segment is committed via manifest swap. Tombstones targeting docs in unmerged segments are carried forward on the merged output.
 - Compaction is non-blocking for reads (segments are immutable; readers hold a manifest snapshot).
 - Manual `compact()` merges all segments into one (output tier = maxExistingTier + 1). Useful for pre-warming read-heavy deployments.
-- **fanout** is configurable via `SegmentManagerOpts.fanout` (default 4). `mergeThreshold` is kept for backward compatibility and used as fanout when `fanout` is not set.
+- **fanout** is configurable via `SegmentManagerOpts.fanout` (default 4).
 
 ## Manifest format
 
@@ -82,8 +82,6 @@ JSON object (v2):
   "totalLen": 19876543
 }
 ```
-
-v1 manifests (without `tier` on segments) are transparently upgraded to v2 on open — all segments get `tier: 0`. The first write after open emits a v2 manifest.
 
 Atomic update: write `manifest.tmp`, fsync, rename to `manifest.json`. Reader retries on partial reads (very narrow window).
 
