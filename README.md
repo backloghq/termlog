@@ -90,10 +90,15 @@ const index = await TermLog.open({
 | `MappingCorruptionError` | docids.snap or docids.log is corrupt |
 | `TokenizerMismatchError` | reopening an index with a different tokenizer config |
 | `IndexLockedError` | another process holds the advisory `.lock` file |
+| `WriteStreamError` | `S3StorageAdapter.createWriteStream` — multipart commands missing from constructor |
 
-## S3 and docIds log
+## S3 notes
 
 `S3StorageAdapter` has no `appendBlob` — on S3 the `docids.log` journal falls back to a read-GET-PUT cycle on every flush, which is O(log size) in bandwidth. For long-running writers, call `compact()` periodically to collapse the log into a snapshot and reset it to empty.
+
+Segments are written via S3 multipart upload. S3 multipart has a maximum object size of 50 GiB; a single segment must fit within that bound. In practice segments stay well under this limit unless you are merging an exceptionally large corpus into a single segment without intermediate compaction.
+
+Stale `.tmp` multipart uploads (crash during a flush or compact) are not automatically cleaned up by termlog. Enable an S3 lifecycle rule to expire incomplete multipart uploads after 1–7 days to avoid accumulating storage charges.
 
 ## Multi-writer / S3 safety
 

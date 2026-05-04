@@ -7,11 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+- `BlobWriteStream` interface and `WriteStreamError` class exported from `src/index.ts` — type-safe streaming write handle and typed error for missing multipart commands.
+- `TermDict.fromSortedEntries(entries)` — zero-copy constructor for callers that already hold entries in lex order (used by `SegmentWriter.finish()`).
+- `FsBackend.createWriteStream` tests: atomicity (target invisible until `end()`), `abort()` cleanup, double-`end()`/double-`abort()` idempotence, write-error propagation, `end()` failure cleanup and subsequent `abort()` no-op.
+- `S3StorageAdapter.createWriteStream` tests: multipart round-trip, >5 MiB part flush, `abort()` on partial upload, missing-command `WriteStreamError`, zero-byte `end()` falls back to `PutObject`, `CompleteMultipartUpload` failure triggers `AbortMultipartUpload`.
+- `Crc32Stream` parity tests against static `crc32()` (empty buffer, single byte, multi-chunk incremental, 256-byte sweep, known-vector).
+- `SegmentWriter` fuzz round-trip tests (1 000 iterations, random term/doc/tf, random doc order), zero-term write, zero-doc term, 1M-doc sidecar, `writeTerm` out-of-order `RangeError` guard.
+
+### Changed
+- `WriteStream` renamed to `BlobWriteStream` everywhere (interface, adapter, tests, docs).
+- `FsBackend.createWriteStream` `end()` is now exception-safe: on fsync/close/rename failure, closes the file handle, unlinks the `.tmp` sidecar, sets `done = true`, then re-throws. Previously `done = true` was set before the sync chain.
+- `SegmentWriter.finish()` sidecar sort now uses a `Uint32Array` index array instead of allocating `Array<[number, number]>` tuples — eliminates ~32 MB of garbage at 1M docs.
+- `SegmentWriter.finish()` term dictionary built via `TermDict.fromSortedEntries()` instead of `fromMap()` — saves three transient allocations since `writeTerm` already enforces lex order.
+- `SegmentWriter.finish()` and `tieredCompactLocked`: `SegmentReader.open()` is now called before `writeManifest()` — if open throws, the manifest is not committed and in-memory state stays consistent.
+- `writeTerm` JSDoc tightened: docIds must be strictly ascending (no duplicates).
+
+### Fixed
+- `S3StorageAdapter.createWriteStream` leaked an incomplete multipart upload when `CompleteMultipartUpload` threw; now calls `AbortMultipartUpload` automatically on Complete failure.
+- `S3StorageAdapter.createWriteStream` called `SendCommand` on a missing command object (undefined) when multipart commands were omitted from the constructor — now throws `WriteStreamError` with a descriptive message before the first upload call.
+- `FsBackend.createWriteStream` `end()` set `done = true` before the sync chain, leaving a live stream with no cleanup on failure.
+- `tieredCompactLocked` committed the manifest before opening the merged `SegmentReader` — a crash during `open()` would leave the in-memory reader snapshot inconsistent with the on-disk manifest.
+
 ## [0.1.0] - 2026-05-04
 
 ### Changed
-- `SegmentWriter` is now a streaming writer: `writeTerm(term, sortedDocIds, sortedTfs)` encodes and writes postings immediately via `WriteStream` — no full postings region buffered in memory. Replaces the accumulate-then-flush `addPosting`/`flush` API.
-- `StorageBackend` interface gains `createWriteStream(path)` returning a `WriteStream` (`write`/`end`/`abort`). `FsBackend` implements it with a `.tmp` sidecar + fsync + atomic rename. `S3StorageAdapter` implements it via the S3 multipart upload protocol (5 MiB part minimum).
+- `SegmentWriter` is now a streaming writer: `writeTerm(term, sortedDocIds, sortedTfs)` encodes and writes postings immediately via `BlobWriteStream` — no full postings region buffered in memory. Replaces the accumulate-then-flush `addPosting`/`flush` API.
+- `StorageBackend` interface gains `createWriteStream(path)` returning a `BlobWriteStream` (`write`/`end`/`abort`). `FsBackend` implements it with a `.tmp` sidecar + fsync + atomic rename. `S3StorageAdapter` implements it via the S3 multipart upload protocol (5 MiB part minimum).
 - `SegmentWriter` doc-length sidecar now uses a packed interleaved `Uint32Array` (`[docId, len, ...]`, 1.5× growth) instead of `Map<number, number>` — 8 bytes/doc vs ~64–80, saving ~56 MB at 1M docs.
 
 ### Performance
