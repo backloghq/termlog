@@ -393,11 +393,11 @@ describe("docids journal + snapshot", () => {
 });
 
 // ---------------------------------------------------------------------------
-// docids.json / manifest atomicity invariant (#30b13d68)
+// docids.snap / manifest atomicity invariant (#30b13d68)
 // ---------------------------------------------------------------------------
 
-describe("docids.json / manifest atomicity invariant", () => {
-  it("docids.json is never behind the manifest after a flush", async () => {
+describe("docids.snap / manifest atomicity invariant", () => {
+  it("docids.snap is never behind the manifest after a flush", async () => {
     const tl = await TermLog.open({ dir, backend, flushThreshold: 1000 });
     await tl.add("doc-a", "hello");
     await tl.add("doc-b", "world");

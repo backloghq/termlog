@@ -2,7 +2,7 @@
 
 Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.
 
-**Status:** v0.2.0. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM tiered compaction, crash recovery, advisory lockfile, reader snapshot isolation, S3 backend.
+**Status:** v0.1.0. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM tiered compaction, crash recovery, advisory lockfile, reader snapshot isolation, S3 backend.
 
 ## Install
 
@@ -34,7 +34,7 @@ Existing FTS engines (Lucene, Tantivy) are great but require native deps or JVM.
 
 ## Architecture
 
-- **Posting lists** — `term → [docId, tf]`, compressed with VByte / delta encoding. (Positions reserved for v0.2+.)
+- **Posting lists** — `term → [docId, tf]`, compressed with VByte / delta encoding. (Positions reserved for a future release.)
 - **Term dictionary** — sorted on disk; binary search for lookup.
 - **Segments** — self-contained immutable files (term dict + postings). New writes create a new segment. Compaction merges N segments into 1.
 - **Query execution** — boolean (AND/OR) via posting iterators (zigzag merge for AND, union scan for OR), BM25 scoring on top.
@@ -67,7 +67,6 @@ const index = await TermLog.open({
 | `flushThreshold` | 1000 | Docs in write buffer before auto-flush |
 | `k1` | 1.2 | BM25 term-saturation parameter |
 | `b` | 0.75 | BM25 length-normalization parameter |
-| `mergeThreshold` | — | Backward-compat alias for `fanout` |
 
 ## Errors
 
@@ -79,6 +78,10 @@ const index = await TermLog.open({
 | `MappingCorruptionError` | docids.snap or docids.log is corrupt |
 | `TokenizerMismatchError` | reopening an index with a different tokenizer config |
 | `IndexLockedError` | another process holds the advisory `.lock` file |
+
+## S3 and docIds log
+
+`S3StorageAdapter` has no `appendBlob` — on S3 the `docids.log` journal falls back to a read-GET-PUT cycle on every flush, which is O(log size) in bandwidth. For long-running writers, call `compact()` periodically to collapse the log into a snapshot and reset it to empty.
 
 ## Multi-writer / S3 safety
 

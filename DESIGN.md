@@ -12,7 +12,7 @@ A log-structured, segment-based full-text search index. Pure TypeScript. Zero na
 
 ## Non-goals (for v0.1)
 
-- Phrase / proximity / positional queries. (Posting lists don't carry positions in v0.1; the format reserves a position column for v0.2+.)
+- Phrase / proximity / positional queries. (Posting lists don't carry positions; the format reserves a position column for a future release.)
 - Per-language analyzers, stemming, stop-word removal. Tokenization is pluggable; default is the same Unicode tokenizer AgentDB ships.
 - Realtime / sub-second freshness. New writes are visible after segment flush. Configurable flush thresholds.
 - Distributed/multi-writer. Single-writer per index, like opslog.
@@ -33,7 +33,7 @@ A **Segment** contains:
   - VByte-encoded number of postings.
   - Delta + VByte-encoded doc IDs.
   - VByte-encoded term frequencies.
-  - (v0.2+) variable-byte-encoded positions.
+  - (future) variable-byte-encoded positions.
 - **Doc-length sidecar** — per-doc length array (for BM25 normalization).
 - **Footer** — magic bytes, version, offsets to dict / postings / sidecar; CRC32 over each region.
 
@@ -51,7 +51,7 @@ Term dict at the end so a writer can stream postings without seeking back to fix
 
 **Delta + VByte for doc IDs:** posting list is sorted by doc ID; encode `(d_i - d_{i-1})` as VByte. First entry encoded directly.
 
-**Frame-of-Reference (FoR)** is a follow-up optimization for v0.2 — block-aligned encoding where each block of 128 doc IDs uses the minimum bit-width that fits the block's max delta. v0.1 ships pure VByte; FoR can be added under the same posting-iterator API.
+**Frame-of-Reference (FoR)** is a follow-up optimization — block-aligned encoding where each block of 128 doc IDs uses the minimum bit-width that fits the block's max delta. Current release ships pure VByte; FoR can be added under the same posting-iterator API.
 
 ## Compaction
 
@@ -110,11 +110,19 @@ interface StorageBackend {
 `FsBackend` ships with termlog. For S3-backed indexes, use the included `S3StorageAdapter`:
 
 ```ts
+import { TermLog } from "@backloghq/termlog";
 import { S3StorageAdapter } from "@backloghq/termlog/s3";
+import { S3Client, GetObjectCommand, PutObjectCommand,
+         DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 
 const tl = await TermLog.open({
   dir: "my-index",
-  backend: new S3StorageAdapter({ bucket: "my-bucket", prefix: "my-index/", region: "us-east-1" }),
+  backend: new S3StorageAdapter({
+    client: new S3Client({ region: "us-east-1" }),
+    commands: { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command },
+    bucket: "my-bucket",
+    prefix: "my-index/",  // required — scopes all keys; never use empty prefix on shared bucket
+  }),
 });
 ```
 
@@ -157,7 +165,6 @@ interface TermLogOptions {
   tokenizer?: Tokenizer;      // defaults to UnicodeTokenizer
   flushThreshold?: number;
   fanout?: number;            // size-tiered compaction fanout, default 4
-  mergeThreshold?: number;    // backward compat alias for fanout
   k1?: number;                // BM25 k1, default 1.2
   b?: number;                 // BM25 b, default 0.75
 }

@@ -77,7 +77,7 @@ export class BM25Ranker {
 
   /**
    * Score documents matching `terms` using the specified boolean mode.
-   * Returns results sorted by score desc, ties broken by string-lexicographic docId asc.
+   * Returns results sorted by score desc, ties broken by numeric docId ascending.
    *
    * @param terms    - query terms (pre-tokenized)
    * @param segments - segment readers to search
@@ -115,7 +115,7 @@ export class BM25Ranker {
 
     if (limit !== undefined && limit > 0) {
       // Path B: top-k min-heap — O(hits * log(limit)) instead of O(hits * log(hits)).
-      // The heap root is the worst element (lowest score; lex-largest docId on tie)
+      // The heap root is the worst element (lowest score; largest numId on tie)
       // so we can evict it when a better candidate arrives.
       const heap = new MinHeap<ScoredDoc>((a, z) => {
         if (a.score !== z.score) return a.score - z.score;
@@ -149,7 +149,7 @@ export class BM25Ranker {
       }
 
       if (heap.size === 0) return [];
-      // Drain heap: arrives in worst-first order; reverse for score-desc, lex-asc.
+      // Drain heap: arrives in worst-first order; reverse for score-desc, numId-asc.
       const results: ScoredDoc[] = [];
       while (heap.size > 0) results.push(heap.pop()!);
       results.reverse();
