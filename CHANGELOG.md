@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+- `QueryPosting.segIndex` — index of the segment owning each result docId, enabling O(1) docLen lookup in `BM25Ranker.score()`.
+- `MultiSegmentIter` rewritten to use `MinHeap<HeapSlot>` — `currentDocId` peek is O(1), seek rebuilds the heap in O(K log K) instead of O(K²).
+- `SegmentReader.docLenEntries()` — exposes the sidecar's `(docId, length)` pairs for compaction without decoding posting lists.
+- Docids append-only journal: `docids.log` (JSONL delta log of add/rm entries) replaces full-rewrite `docids.json` on each flush; `docids.snap` (full snapshot) written on close. Load path: snap → log replay → legacy `docids.json` fallback for backward compatibility.
+- Three journal tests: log written after flush, log replay on crash-reopen (lock deleted to simulate crash), remove entries appear in log.
+
+### Fixed
+- `FsBackend.writeBlob` now fsyncs the data file before rename and the parent directory after rename — ensures both file content and directory entry survive power failure.
+- Compaction first pass decoded all posting lists to collect surviving docIds (O(postings)); now uses `docLenEntries()` (O(docs), sidecar already in RAM).
+- Compaction merge pass used `decodePostings()` (full materialization per term per segment); replaced with lazy `postings()` iterator — constant per-posting memory.
+- `docids.json` full-rewrite on every flush was O(N) for N=total mapped docs; replaced by O(delta) log append — sub-millisecond for any delta size.
+
 ## [0.1.0] - 2026-05-04
 
 ### Added

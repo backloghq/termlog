@@ -349,6 +349,11 @@ export class SegmentReader {
     return this.docLenMap.get(docId) ?? 0;
   }
 
+  /** Iterate all (docId, length) pairs in this segment's sidecar — for compaction. */
+  docLenEntries(): IterableIterator<[number, number]> {
+    return this.docLenMap.entries();
+  }
+
   /** All terms in sorted order (for compaction merging). */
   *terms(): Generator<DictEntry> {
     for (const entry of this.dict) yield entry;

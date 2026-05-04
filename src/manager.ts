@@ -432,15 +432,13 @@ export class SegmentManager {
       for (const id of seg.tombstones) tombstoneUnion.add(id);
     }
 
-    // --- Step 1: build docId renumber map (O(unique surviving docs)) ---
-    // First pass: collect surviving docIds from all posting lists (skip tombstoned).
+    // --- Step 1: build docId renumber map — O(docs), no posting decodes ---
+    // Use the sidecar (already decoded into docLenMap on open) instead of iterating
+    // posting lists, avoiding a full O(postings) first pass.
     const survivingOldDocIds = new Set<number>();
     for (const seg of toMerge) {
-      for (const entry of seg.terms()) {
-        const { docIds } = seg.decodePostings(entry.term);
-        for (const id of docIds) {
-          if (!tombstoneUnion.has(id)) survivingOldDocIds.add(id);
-        }
+      for (const [docId] of seg.docLenEntries()) {
+        if (!tombstoneUnion.has(docId)) survivingOldDocIds.add(docId);
       }
     }
     const oldIds = [...survivingOldDocIds].sort((a, b) => a - b);
@@ -449,12 +447,14 @@ export class SegmentManager {
     const remapOld2New = new Map<number, number>();
     oldIds.forEach((oldId, newId) => remapOld2New.set(oldId, newId));
 
-    // Carry doc lengths forward.
+    // Carry doc lengths forward using the sidecar — O(docs), no posting decodes.
     const docLenMap = new Map<number, number>();
-    for (const oldId of oldIds) {
-      for (const seg of toMerge) {
-        const l = seg.docLen(oldId);
-        if (l > 0) { docLenMap.set(remapOld2New.get(oldId)!, l); break; }
+    for (const seg of toMerge) {
+      for (const [oldId, len] of seg.docLenEntries()) {
+        const newId = remapOld2New.get(oldId);
+        if (newId !== undefined && !docLenMap.has(newId)) {
+          docLenMap.set(newId, len);
+        }
       }
     }
 
@@ -506,15 +506,17 @@ export class SegmentManager {
         prevTerm = top.currentTerm;
       }
 
-      // Drain all heap entries at this term.
+      // Drain all heap entries at this term using lazy posting iterators (O(postings for this term)).
       while (heap.size > 0 && heap.peek()!.currentTerm === prevTerm) {
         const entry = heap.pop()!;
-        const { docIds, tfs } = toMerge[entry.segIndex].decodePostings(prevTerm);
-        for (let i = 0; i < docIds.length; i++) {
-          const newId = remapOld2New.get(docIds[i]);
+        const postIter = toMerge[entry.segIndex].postings(prevTerm);
+        let posting = postIter.next();
+        while (!posting.done) {
+          const newId = remapOld2New.get(posting.value.docId);
           if (newId !== undefined) {
-            termAccum.set(newId, (termAccum.get(newId) ?? 0) + tfs[i]);
+            termAccum.set(newId, (termAccum.get(newId) ?? 0) + posting.value.tf);
           }
+          posting = postIter.next();
         }
         const next = entry.termIter.next();
         if (!next.done) {
