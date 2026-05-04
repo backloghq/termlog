@@ -57,6 +57,14 @@ const MANIFEST_FILE = "manifest.json";
 const MANIFEST_TMP = "manifest.tmp";
 const DEFAULT_MERGE_THRESHOLD = 8;
 
+/** Thrown when manifest.json exists but cannot be parsed (scenario 5). */
+export class ManifestCorruptionError extends Error {
+  constructor(detail: string) {
+    super(`Manifest corruption: ${detail}`);
+    this.name = "ManifestCorruptionError";
+  }
+}
+
 export interface SegmentManagerOpts {
   backend: StorageBackend;
   /** How many buffered docs trigger an automatic flush. Default: 1000. */
@@ -103,10 +111,17 @@ export class SegmentManager {
       opts.tokenizer ?? { kind: "unicode", minLen: 1 },
     );
     await mgr.loadManifest();
+    await mgr.recoverOrphans();
     return mgr;
   }
 
   private async loadManifest(): Promise<void> {
+    // Scenario 3: stale manifest.tmp from interrupted rename — delete it.
+    // manifest.json (if present) is always complete because FsBackend.writeBlob
+    // is itself atomic (writes to .tmp then renames), so manifest.json is either
+    // absent or fully written.
+    try { await this.backend.deleteBlob(MANIFEST_TMP); } catch { /* not present */ }
+
     let raw: Buffer;
     try {
       raw = await this.backend.readBlob(MANIFEST_FILE);
@@ -115,7 +130,14 @@ export class SegmentManager {
       return;
     }
 
-    const manifest: Manifest = JSON.parse(raw.toString("utf8")) as Manifest;
+    // Scenario 5: manifest.json exists but is corrupt JSON.
+    let manifest: Manifest;
+    try {
+      manifest = JSON.parse(raw.toString("utf8")) as Manifest;
+    } catch (err) {
+      throw new ManifestCorruptionError(String(err));
+    }
+
     this.generation = manifest.generation;
     this.manifestSegments = manifest.segments;
     this.totalDocs = manifest.totalDocs;
@@ -123,12 +145,43 @@ export class SegmentManager {
     this.nextSegCounter = manifest.generation + 1;
 
     // Open a SegmentReader for each referenced segment.
+    // Scenario 4: if any segment is corrupt, SegmentReader.open throws
+    // SegmentCorruptionError — propagate to caller.
     const readers: SegmentReader[] = [];
     for (const entry of manifest.segments) {
       const reader = await SegmentReader.open(`${entry.id}.seg`, this.backend);
       readers.push(reader);
     }
     this.readerSnapshot = readers;
+  }
+
+  /**
+   * Scenarios 1 + 2: delete orphaned temp files and unreferenced segment files.
+   * Called after loadManifest so we know which segment IDs are referenced.
+   */
+  private async recoverOrphans(): Promise<void> {
+    const referencedIds = new Set(this.manifestSegments.map((e) => e.id));
+    let allBlobs: string[];
+    try {
+      allBlobs = await this.backend.listBlobs("");
+    } catch {
+      return; // Backend can't list — skip cleanup.
+    }
+
+    for (const blob of allBlobs) {
+      // Delete any *.seg.tmp (abandoned write).
+      if (blob.endsWith(".seg.tmp")) {
+        try { await this.backend.deleteBlob(blob); } catch { /* best-effort */ }
+        continue;
+      }
+      // Delete *.seg files not referenced by the manifest.
+      if (blob.endsWith(".seg")) {
+        const id = blob.slice(0, -4); // strip ".seg"
+        if (!referencedIds.has(id)) {
+          try { await this.backend.deleteBlob(blob); } catch { /* best-effort */ }
+        }
+      }
+    }
   }
 
   /**
