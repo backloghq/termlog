@@ -124,14 +124,14 @@ describe("TermLog facade", () => {
     expect(results.map((r) => r.docId)).toContain("doc-a");
   });
 
-  it("MappingCorruptionError when docids.json is invalid JSON", async () => {
-    // Create a valid index, then corrupt docids.json before reopening.
+  it("MappingCorruptionError when docids.snap is invalid JSON", async () => {
+    // Create a valid index, then corrupt docids.snap before reopening.
     const tl = await TermLog.open({ dir, backend, flushThreshold: 100 });
     await tl.add("x", "hello");
     await tl.close();
 
-    // Overwrite docids.json with invalid content.
-    await writeFile(join(dir, "docids.json"), "not valid json");
+    // Overwrite docids.snap with invalid content.
+    await writeFile(join(dir, "docids.snap"), "not valid json");
 
     await expect(TermLog.open({ dir, backend, flushThreshold: 100 }))
       .rejects.toMatchObject({ name: "MappingCorruptionError" });

@@ -3,7 +3,7 @@
  * FsBackend ships natively; users plug in opslog-s3's S3Backend for cloud storage.
  */
 
-import { readFile, writeFile, readdir, unlink, rename } from "node:fs/promises";
+import { readFile, readdir, unlink, rename, open } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { mkdir } from "node:fs/promises";
 
@@ -39,15 +39,30 @@ export class FsBackend implements StorageBackend {
     return readFile(this.abs(path));
   }
 
-  /** Atomic write: write to a unique <path>.<nonce>.tmp, then rename over <path>. */
+  /** Atomic write: write to a unique <path>.<nonce>.tmp, fsync it, rename over <path>, fsync the directory. */
   async writeBlob(path: string, data: Buffer): Promise<void> {
     const dest = this.abs(path);
+    const dir = dirname(dest);
     // Unique per-call nonce so concurrent writeBlob("same-path") calls don't
     // stomp each other's temp file.
     const tmp = `${dest}.${process.hrtime.bigint()}.tmp`;
-    await mkdir(dirname(dest), { recursive: true });
-    await writeFile(tmp, data);
+    await mkdir(dir, { recursive: true });
+    // fsync the data before rename so the file content is durable.
+    const fh = await open(tmp, "w");
+    try {
+      await fh.write(data);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
     await rename(tmp, dest);
+    // fsync the directory so the rename (directory entry) is durable.
+    const dh = await open(dir, "r");
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
   }
 
   /**

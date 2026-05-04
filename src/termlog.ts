@@ -15,7 +15,8 @@ import { DEFAULT_TOKENIZER } from "./tokenizer.js";
 import type { StorageBackend } from "./storage.js";
 import type { Tokenizer } from "./tokenizer.js";
 
-const DOCIDS_FILE = "docids.json";
+const DOCIDS_SNAP = "docids.snap";
+const DOCIDS_LOG  = "docids.log";
 
 export class MappingCorruptionError extends Error {
   constructor(detail: string) {
@@ -54,6 +55,8 @@ export class TermLog {
   private readonly numToStr = new Map<number, string>();
   /** Monotonically increasing allocator. */
   private nextNumId = 0;
+  /** Pending log lines (adds/removes) not yet flushed to docids.log. */
+  private readonly pendingLog: string[] = [];
 
   private constructor(
     mgr: SegmentManager,
@@ -109,35 +112,92 @@ export class TermLog {
   }
 
   private async loadDocIds(): Promise<void> {
-    let raw: Buffer;
+    // Load snapshot (new format). Fall back to legacy docids.json if no snap exists.
+    let snapRaw: Buffer | null = null;
     try {
-      raw = await this.backend.readBlob(DOCIDS_FILE);
+      snapRaw = await this.backend.readBlob(DOCIDS_SNAP);
     } catch {
-      // No docids.json yet — fresh index.
-      return;
+      // No snap — try legacy file for backward compatibility.
+      try {
+        snapRaw = await this.backend.readBlob("docids.json");
+      } catch {
+        // Fresh index.
+      }
     }
 
-    let parsed: { nextNumId: number; entries: [string, number][] };
+    if (snapRaw !== null) {
+      let parsed: { nextNumId: number; entries: [string, number][] };
+      try {
+        parsed = JSON.parse(snapRaw.toString("utf8")) as typeof parsed;
+      } catch (err) {
+        throw new MappingCorruptionError(String(err));
+      }
+      this.nextNumId = parsed.nextNumId;
+      for (const [str, num] of parsed.entries) {
+        this.strToNum.set(str, num);
+        this.numToStr.set(num, str);
+      }
+    }
+
+    // Replay log (only exists when there are unflushed deltas since last snapshot).
+    let logRaw: Buffer | null = null;
     try {
-      parsed = JSON.parse(raw.toString("utf8")) as typeof parsed;
-    } catch (err) {
-      throw new MappingCorruptionError(String(err));
+      logRaw = await this.backend.readBlob(DOCIDS_LOG);
+    } catch {
+      // No log — nothing to replay.
     }
 
-    this.nextNumId = parsed.nextNumId;
-    for (const [str, num] of parsed.entries) {
-      this.strToNum.set(str, num);
-      this.numToStr.set(num, str);
+    if (logRaw !== null) {
+      const lines = logRaw.toString("utf8").split("\n").filter(Boolean);
+      for (const line of lines) {
+        let entry: { op: string; str: string; num: number };
+        try {
+          entry = JSON.parse(line) as typeof entry;
+        } catch (err) {
+          throw new MappingCorruptionError(`malformed log line: ${String(err)}`);
+        }
+        if (entry.op === "add") {
+          this.strToNum.set(entry.str, entry.num);
+          this.numToStr.set(entry.num, entry.str);
+          if (entry.num >= this.nextNumId) this.nextNumId = entry.num + 1;
+        } else if (entry.op === "rm") {
+          this.strToNum.delete(entry.str);
+          this.numToStr.delete(entry.num);
+        }
+      }
     }
   }
 
+  /** Append pending deltas to docids.log (called by onBeforeManifest — O(delta) not O(N)). */
   private async saveDocIds(): Promise<void> {
+    if (this.pendingLog.length === 0) return;
+    const lines = this.pendingLog.join("\n") + "\n";
+    // Read existing log and append; writeBlob is atomic but full-replace, so we concat.
+    let existing = "";
+    try {
+      existing = (await this.backend.readBlob(DOCIDS_LOG)).toString("utf8");
+    } catch {
+      // No log yet — start fresh.
+    }
+    await this.backend.writeBlob(DOCIDS_LOG, Buffer.from(existing + lines, "utf8"));
+    this.pendingLog.length = 0;
+  }
+
+  /** Write a full snapshot and delete the log (called on close/compaction). */
+  private async snapshotDocIds(): Promise<void> {
+    // Flush any pending log entries first so they're captured in the snapshot.
+    await this.saveDocIds();
     const payload = {
       nextNumId: this.nextNumId,
       entries: [...this.strToNum.entries()],
     };
-    const data = Buffer.from(JSON.stringify(payload), "utf8");
-    await this.backend.writeBlob(DOCIDS_FILE, data);
+    await this.backend.writeBlob(DOCIDS_SNAP, Buffer.from(JSON.stringify(payload), "utf8"));
+    // Delete the log — snapshot is now authoritative.
+    try {
+      await this.backend.deleteBlob(DOCIDS_LOG);
+    } catch {
+      // Ignore — log may not exist.
+    }
   }
 
   /** Add or update a document. Tokenizes text and indexes it. */
@@ -153,6 +213,7 @@ export class TermLog {
       numId = this.nextNumId++;
       this.strToNum.set(docId, numId);
       this.numToStr.set(numId, docId);
+      this.pendingLog.push(JSON.stringify({ op: "add", str: docId, num: numId }));
     }
 
     await this.mgr.add(numId, terms);
@@ -165,6 +226,7 @@ export class TermLog {
     await this.mgr.remove(numId);
     this.strToNum.delete(docId);
     this.numToStr.delete(numId);
+    this.pendingLog.push(JSON.stringify({ op: "rm", str: docId, num: numId }));
   }
 
   /**
@@ -205,10 +267,9 @@ export class TermLog {
   /** Close: flush pending writes and release the advisory lock. */
   async close(): Promise<void> {
     await this.mgr.close();
-    // Save mapping unconditionally on close — flushLocked only calls onBeforeManifest
-    // when the buffer is non-empty; an in-memory-only remove (buffer drop) would
-    // otherwise leave the mapping stale until the next flush.
-    await this.saveDocIds();
+    // Snapshot on close — consolidates log into snap, removes log.
+    // Also captures in-memory-only removes that never triggered onBeforeManifest.
+    await this.snapshotDocIds();
   }
 
   /** Number of indexed documents (flushed to segments). */

@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { rm, mkdtemp, writeFile } from "node:fs/promises";
+import { rm, mkdtemp, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { crc32 } from "../src/crc32.js";
@@ -329,6 +329,59 @@ describe("manifest version validation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// docids append-only journal (#581503f8)
+// ---------------------------------------------------------------------------
+
+describe("docids journal + snapshot", () => {
+  it("flush writes docids.log; close collapses to docids.snap + no log", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1 });
+    await tl.add("doc-a", "hello");
+    // After auto-flush (threshold=1), docids.log should exist with the add entry.
+    const logAfterFlush = await backend.readBlob("docids.log");
+    const lines = logAfterFlush.toString("utf8").trim().split("\n");
+    const entry = JSON.parse(lines[0]) as { op: string; str: string; num: number };
+    expect(entry.op).toBe("add");
+    expect(entry.str).toBe("doc-a");
+
+    await tl.close();
+    // After close: docids.snap exists, docids.log is gone.
+    await expect(backend.readBlob("docids.snap")).resolves.toBeTruthy();
+    await expect(backend.readBlob("docids.log")).rejects.toThrow();
+  });
+
+  it("log replay: entries added between flushes survive a crash-reopen", async () => {
+    // Open with a high threshold so we control when flush happens.
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    await tl.add("alpha", "foo bar");
+    await tl.add("beta", "baz");
+    // Flush triggers onBeforeManifest → saveDocIds → appends to docids.log.
+    await tl.flush();
+    // Simulate crash: delete the lock file so a fresh open can claim the index.
+    await unlink(join(dir, ".lock"));
+    const tl2 = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    const results = await tl2.search("foo");
+    expect(results.map((r) => r.docId)).toContain("alpha");
+    await tl2.close();
+  });
+
+  it("remove entries appear in log and are replayed correctly", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    await tl.add("doc-a", "hello");
+    await tl.add("doc-b", "world");
+    await tl.remove("doc-a");
+    await tl.flush();
+    // Log should contain add(doc-a), add(doc-b), rm(doc-a).
+    const logRaw = await backend.readBlob("docids.log");
+    const logLines = logRaw.toString("utf8").trim().split("\n").map((l) => JSON.parse(l) as { op: string; str: string });
+    const ops = logLines.map((e) => `${e.op}:${e.str}`);
+    expect(ops).toContain("add:doc-a");
+    expect(ops).toContain("add:doc-b");
+    expect(ops).toContain("rm:doc-a");
+    await tl.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // docids.json / manifest atomicity invariant (#30b13d68)
 // ---------------------------------------------------------------------------
 
@@ -347,21 +400,20 @@ describe("docids.json / manifest atomicity invariant", () => {
     await tl2.close();
   });
 
-  it("crash-simulation: docids.json written before manifest; reopen recovers correctly", async () => {
-    // Simulate the scenario: docids.json exists but manifest has not yet committed.
-    // We do this by creating docids.json manually with an extra entry that the
-    // manifest doesn't reference — the extra entry should be harmless phantom.
+  it("crash-simulation: docids.snap written before manifest; reopen recovers correctly", async () => {
+    // Simulate the scenario: docids.snap exists but manifest has not yet committed.
+    // We do this by injecting a phantom entry into docids.snap — it must be harmless.
     const tl = await TermLog.open({ dir, backend, flushThreshold: 1000 });
     await tl.add("real-doc", "hello");
     await tl.flush();
     await tl.close();
 
-    // Inject a phantom mapping entry into docids.json (simulates pre-manifest write).
-    const raw = await backend.readBlob("docids.json");
+    // Inject a phantom mapping entry into docids.snap (simulates pre-manifest write).
+    const raw = await backend.readBlob("docids.snap");
     const mapping = JSON.parse(raw.toString("utf8")) as { nextNumId: number; entries: [string, number][] };
     mapping.entries.push(["phantom-doc", mapping.nextNumId]);
     mapping.nextNumId++;
-    await backend.writeBlob("docids.json", Buffer.from(JSON.stringify(mapping), "utf8"));
+    await backend.writeBlob("docids.snap", Buffer.from(JSON.stringify(mapping), "utf8"));
 
     // Reopening must succeed; phantom entry is harmless (no segment data for it).
     const tl2 = await TermLog.open({ dir, backend, flushThreshold: 1000 });
