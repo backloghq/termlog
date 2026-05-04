@@ -42,6 +42,9 @@ export interface TermLogOptions {
   backend?: StorageBackend;
   tokenizer?: Tokenizer;
   flushThreshold?: number;
+  /** Size-tiered compaction fanout — how many same-tier segments trigger a merge. Default 4. */
+  fanout?: number;
+  /** Backward compat alias for `fanout`. Ignored when `fanout` is set. */
   mergeThreshold?: number;
   k1?: number;
   b?: number;
@@ -96,6 +99,7 @@ export class TermLog {
       backend,
       dir: opts.dir,
       flushThreshold: opts.flushThreshold,
+      fanout: opts.fanout,
       mergeThreshold: opts.mergeThreshold,
       tokenizer: { kind: tokenizer.kind, minLen: tokenizer.minLen ?? 1 },
       onBeforeManifest: () => box.tl!.saveDocIds(),

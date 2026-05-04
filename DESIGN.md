@@ -55,22 +55,26 @@ Term dict at the end so a writer can stream postings without seeking back to fix
 
 ## Compaction
 
-Standard LSM merge:
+Size-tiered LSM merge:
 
-- Threshold: `>= MERGE_THRESHOLD` segments triggers a merge (configurable; default 8).
-- Tiered: merge segments of similar size to bound write amplification.
-- During merge, doc IDs are re-numbered into a single dense range; old segments are deleted only after the merged segment is committed via manifest swap.
+- Each flushed segment starts at **tier 0**.
+- After each flush, `chooseCompactionTargets()` finds the lowest tier with `>= fanout` segments and merges exactly `fanout` of them into a single new segment at `tier + 1`.
+- This cascades: after the merge completes, if the resulting tier now has `>= fanout` segments, another merge fires — and so on until no tier is eligible.
+- Write amplification is bounded by `O(N log_{fanout} N)`: each document passes through at most `log_{fanout}(N)` merge levels. With fanout=4 and N=1M that is 10 levels (vs unbounded for naive merge-all).
+- During merge, doc IDs are re-numbered into a dense range per segment; old segments are deleted only after the merged segment is committed via manifest swap.
 - Compaction is non-blocking for reads (segments are immutable; readers hold a manifest snapshot).
+- Manual `compact()` merges all segments into one (output tier = maxExistingTier + 1). Useful for pre-warming read-heavy deployments.
+- **fanout** is configurable via `SegmentManagerOpts.fanout` (default 4). `mergeThreshold` is kept for backward compatibility and used as fanout when `fanout` is not set.
 
 ## Manifest format
 
-JSON object:
+JSON object (v2):
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "generation": 42,             // monotonic, incremented per commit
   "segments": [
-    { "id": "seg-000042", "docCount": 12345, "totalLen": 2345678 },
+    { "id": "seg-000042", "docCount": 12345, "totalLen": 2345678, "tier": 2 },
     ...
   ],
   "tokenizer": { "kind": "unicode", "minLen": 1 },
@@ -78,6 +82,8 @@ JSON object:
   "totalLen": 19876543
 }
 ```
+
+v1 manifests (without `tier` on segments) are transparently upgraded to v2 on open — all segments get `tier: 0`. The first write after open emits a v2 manifest.
 
 Atomic update: write `manifest.tmp`, fsync, rename to `manifest.json`. Reader retries on partial reads (very narrow window).
 
@@ -135,7 +141,8 @@ interface TermLogOptions {
   backend?: StorageBackend;   // defaults to FsBackend
   tokenizer?: Tokenizer;      // defaults to UnicodeTokenizer
   flushThreshold?: number;
-  mergeThreshold?: number;
+  fanout?: number;            // size-tiered compaction fanout, default 4
+  mergeThreshold?: number;    // backward compat alias for fanout
   k1?: number;                // BM25 k1, default 1.2
   b?: number;                 // BM25 b, default 0.75
 }

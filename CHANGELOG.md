@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ## [Unreleased]
 
 ### Added
+- **Size-tiered compaction** (`#14614fcf`): segments now carry a `tier` field. After each flush, `chooseCompactionTargets()` picks the lowest tier with `>= fanout` segments and merges exactly `fanout` of them into a new segment at `tier + 1`. This cascades until no tier is eligible. Write amplification is `O(N log_{fanout} N)` — each doc is rewritten at most `log_4(256)=4` times for N=256 with the default fanout=4. Manual `compact()` merges everything into one segment (`maxTier + 1`), unchanged semantics for callers that call it explicitly.
+- `fanout` option on `SegmentManagerOpts` and `TermLogOptions` — configures the size-tiered compaction fanout (default 4). `mergeThreshold` is kept as a backward-compat alias.
+- `ManifestSegmentEntry.tier` field — per-segment compaction tier stored in the manifest.
+- Manifest v2 format adds `tier` to each segment entry. v1 manifests (no `tier`) are transparently upgraded on open: all segments assigned `tier: 0`. The first write after open emits a v2 manifest.
+- `ManifestVersionError` now validates `version <= MANIFEST_VERSION` (was `=== 1`); accepts both v1 and v2.
+- `docIds.docCount` property on `SegmentReader` used for per-segment base-offset computation during merge — prevents internal docId collisions when merging previously-merged segments.
+- Tiered compaction test suite: cascade promotion (tier-0 → tier-1 → tier-2), all docs recoverable after multi-tier promotion, v1 manifest upgrade (tier=0 assigned, cascade fires correctly), manual `compact()` correctness and persistence across reopen, configurable fanout (fanout=2, fanout=8, mergeThreshold as fanout alias), write-amplification bound assertions (O(N log N) verified at N=256).
 - `QueryPosting.segIndex` — index of the segment owning each result docId, enabling O(1) docLen lookup in `BM25Ranker.score()`.
 - `MultiSegmentIter` rewritten to use `MinHeap<HeapSlot>` — `currentDocId` peek is O(1), seek rebuilds the heap in O(K log K) instead of O(K²).
 - `SegmentReader.docLenEntries()` — exposes the sidecar's `(docId, length)` pairs for compaction without decoding posting lists.

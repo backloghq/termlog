@@ -2,22 +2,23 @@
  * SegmentManager — coordinates write buffer, segment flush, manifest, and compaction.
  *
  * Manifest format (manifest.json):
- *   { version: 1, generation: N, segments: [{id, docCount, totalLen}],
- *     tokenizer: {kind, minLen}, totalDocs, totalLen }
+ *   v1: { version: 1, generation: N, segments: [{id, docCount, totalLen}],
+ *          tokenizer: {kind, minLen}, totalDocs, totalLen }
+ *   v2: { version: 2, generation: N, segments: [{id, docCount, totalLen, tier}],
+ *          tokenizer: {kind, minLen}, totalDocs, totalLen }
+ *   v1 manifests are transparently upgraded to v2 on open (all segments get tier=0).
  *
  * Manifest is updated atomically: write manifest.tmp → rename to manifest.json.
  * Readers call `segments()` to get an immutable snapshot of the current reader list;
  * a concurrent flush or compaction does not affect that snapshot (segments are immutable,
  * old-segment deletion is deferred until after manifest commit).
  *
- * Compaction (LSM one-tier merge):
- *   1. Snapshot the current segment list (non-blocking to concurrent adds).
- *   2. K-way merge posting iterators by (term, docId) lex order.
- *   3. Re-number doc IDs to a dense range; carry doc-length sidecar forward.
- *   4. Write merged segment atomically (.seg.tmp → rename).
- *   5. Atomic manifest swap: new manifest references merged segment + any segments
- *      created during compaction; old compacted segments removed.
- *   6. Delete old segment files only after manifest commit.
+ * Compaction (LSM size-tiered):
+ *   Each segment has a tier. After each flush the new segment starts at tier 0.
+ *   chooseCompactionTargets() finds the lowest tier with >= fanout segments and merges them
+ *   into a single segment at tier+1. This cascades: after a successful merge, if the
+ *   result pushes tier+1 over the fanout, another merge is triggered automatically.
+ *   Manual compact() merges everything into a single segment at maxTier+1.
  */
 
 import { open as fsOpen, readFile as fsReadFile, unlink as fsUnlink } from "node:fs/promises";
@@ -32,6 +33,8 @@ export interface ManifestSegmentEntry {
   id: string;
   docCount: number;
   totalLen: number;
+  /** Compaction tier. 0 = freshly flushed; N = result of merging fanout tier-(N-1) segments. */
+  tier: number;
 }
 
 export interface TokenizerConfig {
@@ -55,12 +58,14 @@ interface BufferedDoc {
   totalLen: number;
 }
 
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
+const MANIFEST_MIN_SUPPORTED = 1;
 const MANIFEST_FILE = "manifest.json";
 const MANIFEST_TMP = "manifest.tmp";
 const LOCK_FILE = ".lock";
 export const DEFAULT_FLUSH_THRESHOLD = 1000;
 const DEFAULT_MERGE_THRESHOLD = 8;
+const DEFAULT_FANOUT = 4;
 
 /** Thrown when manifest.json exists but cannot be parsed. */
 export class ManifestCorruptionError extends Error {
@@ -70,13 +75,13 @@ export class ManifestCorruptionError extends Error {
   }
 }
 
-/** Thrown when the manifest's `version` field is not the version this code supports. */
+/** Thrown when the manifest's `version` field is outside the range this code supports. */
 export class ManifestVersionError extends Error {
   constructor(
     public readonly found: number,
     public readonly expected: number,
   ) {
-    super(`Unsupported manifest version ${found} (expected ${expected})`);
+    super(`Unsupported manifest version ${found} (expected <= ${expected})`);
     this.name = "ManifestVersionError";
   }
 }
@@ -95,8 +100,17 @@ export interface SegmentManagerOpts {
   dir?: string;
   /** How many buffered docs trigger an automatic flush. Default: 1000. */
   flushThreshold?: number;
-  /** How many segments trigger automatic compaction. Default: 8. */
+  /**
+   * How many segments of the same tier trigger an automatic tiered compaction merge.
+   * Default: 8. Kept for backward compatibility — when `fanout` is not set this value
+   * is used as the fanout.
+   */
   mergeThreshold?: number;
+  /**
+   * How many same-tier segments trigger a tier merge (size-tiered compaction).
+   * When set, takes precedence over `mergeThreshold`. Default: 4.
+   */
+  fanout?: number;
   tokenizer?: TokenizerConfig;
   /**
    * Called after the segment file is written but BEFORE the manifest is committed.
@@ -111,6 +125,7 @@ export class SegmentManager {
   private readonly backend: StorageBackend;
   private readonly flushThreshold: number;
   private readonly mergeThreshold: number;
+  private readonly tieredFanout: number;
   private readonly tokenizerConfig: TokenizerConfig;
   private readonly onBeforeManifest: (() => Promise<void>) | undefined;
   /** Absolute path to the .lock file, or null for non-local-FS backends. */
@@ -148,21 +163,25 @@ export class SegmentManager {
     backend: StorageBackend,
     flushThreshold: number,
     mergeThreshold: number,
+    tieredFanout: number,
     tokenizerConfig: TokenizerConfig,
     onBeforeManifest?: () => Promise<void>,
   ) {
     this.backend = backend;
     this.flushThreshold = flushThreshold;
     this.mergeThreshold = mergeThreshold;
+    this.tieredFanout = tieredFanout;
     this.tokenizerConfig = tokenizerConfig;
     this.onBeforeManifest = onBeforeManifest;
   }
 
   static async open(opts: SegmentManagerOpts): Promise<SegmentManager> {
+    const effectiveFanout = opts.fanout ?? opts.mergeThreshold ?? DEFAULT_FANOUT;
     const mgr = new SegmentManager(
       opts.backend,
       opts.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD,
       opts.mergeThreshold ?? DEFAULT_MERGE_THRESHOLD,
+      effectiveFanout,
       opts.tokenizer ?? { kind: "unicode", minLen: 1 },
       opts.onBeforeManifest,
     );
@@ -248,7 +267,7 @@ export class SegmentManager {
       throw new ManifestCorruptionError(String(err));
     }
 
-    if (manifest.version !== MANIFEST_VERSION) {
+    if (manifest.version < MANIFEST_MIN_SUPPORTED || manifest.version > MANIFEST_VERSION) {
       throw new ManifestVersionError(manifest.version, MANIFEST_VERSION);
     }
 
@@ -256,7 +275,11 @@ export class SegmentManager {
     this._persistedTokenizerKind = manifest.tokenizer.kind;
     this._persistedTokenizerMinLen = manifest.tokenizer.minLen;
     this.generation = manifest.generation;
-    this.manifestSegments = manifest.segments;
+    // v1 → v2 upgrade: assign tier=0 to all segments (they were never tiered).
+    this.manifestSegments = manifest.segments.map((e) => ({
+      ...e,
+      tier: (e as ManifestSegmentEntry).tier ?? 0,
+    }));
     this.totalDocs = manifest.totalDocs;
     this.totalLen = manifest.totalLen;
     this.nextSegCounter = manifest.generation + 1;
@@ -304,8 +327,8 @@ export class SegmentManager {
 
   /**
    * Buffer a document. `terms` is the analyzed term list with per-term frequencies.
-   * Auto-flushes when the buffer reaches `flushThreshold`, and may auto-compact if
-   * the resulting segment count reaches `mergeThreshold`.
+   * Auto-flushes when the buffer reaches `flushThreshold`, then cascades tiered compaction
+   * as long as any tier has >= fanout segments.
    */
   async add(
     docId: number,
@@ -316,9 +339,7 @@ export class SegmentManager {
       this.buffer.push({ docId, terms, totalLen });
       if (this.buffer.length >= this.flushThreshold) {
         await this.flushLocked();
-        if (this.manifestSegments.length >= this.mergeThreshold) {
-          await this.compactLocked();
-        }
+        await this.cascadeCompactLocked();
       }
     });
   }
@@ -380,6 +401,7 @@ export class SegmentManager {
       id: segId,
       docCount: this.buffer.length,
       totalLen: segTotalLen,
+      tier: 0,
     };
 
     // Clear buffer before manifest update so a crash between flush and manifest
@@ -412,65 +434,120 @@ export class SegmentManager {
   /**
    * Merge all current segments into one. Safe to call manually at any time.
    * No-op if there is zero or one segment.
-   *
-   * Algorithm:
-   *   1. Snapshot the segment readers (non-blocking; concurrent adds continue).
-   *   2. K-way merge: collect all (term → [{docId, tf}]) across segments.
-   *   3. Re-number doc IDs to a dense range [0, N); carry doc lengths forward.
-   *   4. Write the merged segment atomically.
-   *   5. Atomic manifest swap: keep only the merged segment + any segments
-   *      created during compaction (those not in the snapshot).
-   *   6. Delete old segment files (post-commit; safe because manifest is
-   *      the source of truth and old readers hold their own Buffer references).
+   * The merged result is assigned tier = maxExistingTier + 1.
    */
   async compact(): Promise<void> {
-    return this.serialize(() => this.compactLocked());
+    return this.serialize(async () => {
+      if (this.manifestSegments.length <= 1) return;
+      const maxTier = this.manifestSegments.reduce((m, e) => Math.max(m, e.tier), 0);
+      const allIndices = this.manifestSegments.map((_, i) => i);
+      await this.tieredCompactLocked(allIndices, maxTier + 1);
+    });
   }
 
-  private async compactLocked(): Promise<void> {
-    // Snapshot readers and their corresponding manifest IDs atomically.
-    const toMerge = this.readerSnapshot;
-    const toMergeCount = toMerge.length;
-    if (toMergeCount <= 1) return;
+  /**
+   * Pick the compaction target: lowest tier with >= fanout segments.
+   * Returns the tier and exactly `fanout` segment indices from that tier (the first fanout
+   * by position, so segments are merged in arrival order).
+   * Returns null if no tier has enough segments.
+   */
+  private chooseCompactionTargets(): { tier: number; indices: number[] } | null {
+    const byTier = new Map<number, number[]>();
+    for (let i = 0; i < this.manifestSegments.length; i++) {
+      const t = this.manifestSegments[i].tier;
+      const arr = byTier.get(t);
+      if (arr) arr.push(i);
+      else byTier.set(t, [i]);
+    }
+    // Find the lowest tier with >= fanout segments.
+    let minTier = Infinity;
+    for (const [tier, indices] of byTier) {
+      if (indices.length >= this.tieredFanout && tier < minTier) minTier = tier;
+    }
+    if (minTier === Infinity) return null;
+    // Merge exactly fanout segments per step (first fanout by position).
+    const allAtTier = byTier.get(minTier)!;
+    return { tier: minTier, indices: allAtTier.slice(0, this.tieredFanout) };
+  }
 
-    // IDs of the segments being merged — captured at snapshot time.
-    const toMergeIds = new Set(this.manifestSegments.slice(0, toMergeCount).map((e) => e.id));
+  /**
+   * Run cascade compaction: repeatedly find the lowest eligible tier and merge it
+   * until no tier has >= fanout segments.
+   */
+  private async cascadeCompactLocked(): Promise<void> {
+    let target = this.chooseCompactionTargets();
+    while (target !== null) {
+      await this.tieredCompactLocked(target.indices, target.tier + 1);
+      target = this.chooseCompactionTargets();
+    }
+  }
+
+  /**
+   * Merge the segments at the given indices into a single new segment with the
+   * given output tier. Segments not in the merge set are preserved unchanged.
+   *
+   * Algorithm:
+   *   1. Build union tombstone set across merged segments.
+   *   2. Build docId renumber map using sidecar (O(docs), no posting decodes).
+   *   3. K-way merge posting iterators by (term, segIndex) lex order.
+   *   4. Write merged segment atomically (.seg.tmp → rename).
+   *   5. Atomic manifest swap: merged segment + any segments not in the merge set.
+   *   6. Delete old segment files post-commit.
+   */
+  private async tieredCompactLocked(indices: number[], outputTier: number): Promise<void> {
+    if (indices.length <= 1) return;
+
+    const toMergeIndices = new Set(indices);
+    const toMergeEntries = indices.map((i) => this.manifestSegments[i]);
+    const toMergeIds = new Set(toMergeEntries.map((e) => e.id));
+
+    // Map segment index → position in readerSnapshot. The two arrays are parallel.
+    const toMergeReaders = indices.map((i) => this.readerSnapshot[i]);
 
     // Build the union tombstone set across all merged segments.
     const tombstoneUnion = new Set<number>();
-    for (const seg of toMerge) {
+    for (const seg of toMergeReaders) {
       for (const id of seg.tombstones) tombstoneUnion.add(id);
     }
 
-    // --- Step 1: build docId renumber map — O(docs), no posting decodes ---
-    // Use the sidecar (already decoded into docLenMap on open) instead of iterating
-    // posting lists, avoiding a full O(postings) first pass.
-    const survivingOldDocIds = new Set<number>();
-    for (const seg of toMerge) {
-      for (const [docId] of seg.docLenEntries()) {
-        if (!tombstoneUnion.has(docId)) survivingOldDocIds.add(docId);
-      }
+    // --- Step 1: build per-segment docId renumber maps using sidecar — O(docs) ---
+    //
+    // Each segment has its own internal docId space (both originals from the writer and
+    // previously-merged segments renumber to [0, N)). We assign each segment a base offset
+    // in the global space so IDs from different segments never collide:
+    //   globalId = segmentBase[si] + localDocId
+    //
+    // After computing the global space, surviving docs are renumbered densely.
+    const segmentBase: number[] = [];
+    let baseOffset = 0;
+    for (const seg of toMergeReaders) {
+      segmentBase.push(baseOffset);
+      baseOffset += seg.docCount;
     }
-    const oldIds = [...survivingOldDocIds].sort((a, b) => a - b);
 
-    // Re-number to dense range.
-    const remapOld2New = new Map<number, number>();
-    oldIds.forEach((oldId, newId) => remapOld2New.set(oldId, newId));
-
-    // Carry doc lengths forward using the sidecar — O(docs), no posting decodes.
-    const docLenMap = new Map<number, number>();
-    for (const seg of toMerge) {
-      for (const [oldId, len] of seg.docLenEntries()) {
-        const newId = remapOld2New.get(oldId);
-        if (newId !== undefined && !docLenMap.has(newId)) {
-          docLenMap.set(newId, len);
+    // Collect (globalId, len) for all surviving docs.
+    const survivingDocs = new Map<number, number>(); // globalId → len
+    for (let si = 0; si < toMergeReaders.length; si++) {
+      const base = segmentBase[si];
+      for (const [localId, len] of toMergeReaders[si].docLenEntries()) {
+        const globalId = base + localId;
+        if (!tombstoneUnion.has(localId)) {
+          survivingDocs.set(globalId, len);
         }
       }
     }
 
+    const oldIds = [...survivingDocs.keys()].sort((a, b) => a - b);
+    const remapGlobal2New = new Map<number, number>();
+    oldIds.forEach((globalId, newId) => remapGlobal2New.set(globalId, newId));
+
+    const docLenMap = new Map<number, number>();
+    for (const [globalId, len] of survivingDocs) {
+      const newId = remapGlobal2New.get(globalId);
+      if (newId !== undefined) docLenMap.set(newId, len);
+    }
+
     // --- Step 2: streaming k-way merge of term iterators into SegmentWriter ---
-    // Uses a min-heap keyed by (term, segIndex) — O(K) heap entries at any time,
-    // O(largest single posting list) for the per-term accumulator.
     const mergedId = `seg-${String(this.nextSegCounter).padStart(6, "0")}`;
     this.nextSegCounter++;
 
@@ -488,8 +565,8 @@ export class SegmentManager {
       return a.segIndex - b.segIndex;
     });
 
-    for (let si = 0; si < toMerge.length; si++) {
-      const termIter = toMerge[si].terms();
+    for (let si = 0; si < toMergeReaders.length; si++) {
+      const termIter = toMergeReaders[si].terms();
       const first = termIter.next();
       if (!first.done) {
         heap.push({ segIndex: si, termIter, currentTerm: first.value.term });
@@ -497,7 +574,6 @@ export class SegmentManager {
     }
 
     let prevTerm: string | null = null;
-    // Accumulator for the current term's postings: Map<newDocId, tf>
     let termAccum = new Map<number, number>();
 
     const flushTerm = () => {
@@ -516,13 +592,14 @@ export class SegmentManager {
         prevTerm = top.currentTerm;
       }
 
-      // Drain all heap entries at this term using lazy posting iterators (O(postings for this term)).
       while (heap.size > 0 && heap.peek()!.currentTerm === prevTerm) {
         const entry = heap.pop()!;
-        const postIter = toMerge[entry.segIndex].postings(prevTerm);
+        const base = segmentBase[entry.segIndex];
+        const postIter = toMergeReaders[entry.segIndex].postings(prevTerm!);
         let posting = postIter.next();
         while (!posting.done) {
-          const newId = remapOld2New.get(posting.value.docId);
+          const globalId = base + posting.value.docId;
+          const newId = remapGlobal2New.get(globalId);
           if (newId !== undefined) {
             termAccum.set(newId, (termAccum.get(newId) ?? 0) + posting.value.tf);
           }
@@ -543,21 +620,18 @@ export class SegmentManager {
 
     await writer.flush(mergedId, this.backend);
 
-    // --- Step 4: atomic manifest swap ---
-    // Segments that were flushed *during* compaction are not in toMergeIds — preserve them.
-    const survivingEntries = this.manifestSegments.filter((e) => !toMergeIds.has(e.id));
-
+    // --- Step 3: atomic manifest swap ---
     const mergedEntry: ManifestSegmentEntry = {
       id: mergedId,
       docCount: oldIds.length,
       totalLen: [...docLenMap.values()].reduce((s, l) => s + l, 0),
+      tier: outputTier,
     };
 
+    // Keep segments not in the merge set, preserving their original order.
+    const survivingEntries = this.manifestSegments.filter((e) => !toMergeIds.has(e.id));
     const newSegmentList = [mergedEntry, ...survivingEntries];
 
-    // Derive totalDocs and totalLen from the new segment list so tombstoned docs
-    // are reflected immediately rather than relying on the running counter (which
-    // was only ever incremented, never decremented).
     const newTotalDocs = newSegmentList.reduce((s, e) => s + e.docCount, 0);
     const newTotalLen = newSegmentList.reduce((s, e) => s + e.totalLen, 0);
     this.totalDocs = newTotalDocs;
@@ -574,12 +648,12 @@ export class SegmentManager {
     });
     this.manifestSegments = newSegmentList;
 
-    // Rebuild reader snapshot: merged reader + any readers created during compaction.
+    // Rebuild reader snapshot: merged reader replaces merged segments; others kept in order.
     const mergedReader = await SegmentReader.open(`${mergedId}.seg`, this.backend);
-    const survivingReaders = this.readerSnapshot.slice(toMergeCount);
+    const survivingReaders = this.readerSnapshot.filter((_, i) => !toMergeIndices.has(i));
     this.readerSnapshot = [mergedReader, ...survivingReaders];
 
-    // --- Step 5: delete old segment files (post-manifest-commit) ---
+    // --- Step 4: delete old segment files (post-manifest-commit) ---
     for (const oldId of toMergeIds) {
       try { await this.backend.deleteBlob(`${oldId}.seg`); } catch { /* best-effort */ }
     }

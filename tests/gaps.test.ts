@@ -335,7 +335,7 @@ describe("manifest version validation", () => {
     const err = await SegmentManager.open({ backend, dir }).catch((e) => e);
     expect(err).toBeInstanceOf(ManifestVersionError);
     expect(err.found).toBe(99);
-    expect(err.expected).toBe(1);
+    expect(err.expected).toBe(2);
   });
 });
 
