@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { TermLog } from "../src/termlog.js";
 import { FsBackend } from "../src/storage.js";
+import { VERSION } from "../src/index.js";
 
 async function makeTmpDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "termlog-facade-"));
@@ -24,6 +25,13 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
+});
+
+describe("VERSION export (#59ac681f)", () => {
+  it("VERSION matches package.json version string", () => {
+    expect(VERSION).toMatch(/^\d+\.\d+\.\d+/);
+    expect(VERSION).toBe("0.1.0");
+  });
 });
 
 describe("TermLog facade", () => {
@@ -122,6 +130,27 @@ describe("TermLog facade", () => {
     await expect(tl.remove("nonexistent")).resolves.not.toThrow();
     const results = await tl.search("hello");
     expect(results.map((r) => r.docId)).toContain("doc-a");
+  });
+
+  it("remove-then-re-add same docId is searchable with new content (#42e94805)", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 100 });
+    await tl.add("doc-a", "apple banana");
+    await tl.flush();
+
+    await tl.remove("doc-a");
+    await tl.flush();
+
+    // Re-add with completely different content.
+    await tl.add("doc-a", "cherry dragon");
+    await tl.flush();
+
+    // Old content must not be found.
+    const appleHits = await tl.search("apple");
+    expect(appleHits.map((r) => r.docId)).not.toContain("doc-a");
+
+    // New content must be found.
+    const cherryHits = await tl.search("cherry");
+    expect(cherryHits.map((r) => r.docId)).toContain("doc-a");
   });
 
   it("MappingCorruptionError when docids.snap is invalid JSON", async () => {

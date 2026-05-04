@@ -1,6 +1,6 @@
 /**
- * StorageBackend abstraction — mirrors opslog's interface.
- * FsBackend ships natively; users plug in opslog-s3's S3Backend for cloud storage.
+ * StorageBackend abstraction — pluggable blob storage.
+ * FsBackend ships natively; S3StorageAdapter wraps any S3-compatible backend.
  */
 
 import { readFile, readdir, unlink, rename, open } from "node:fs/promises";

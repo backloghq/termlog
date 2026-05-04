@@ -22,7 +22,7 @@ await index.add("doc-2", "the lazy dog");
 await index.flush();
 
 const results = await index.search("fox", { limit: 10 });
-// [{ docId: "doc-1", score: 0.693... }]
+// [{ docId: "doc-1", score: 0.655... }]  (BM25 — exact value depends on corpus)
 
 await index.remove("doc-1");
 await index.close();

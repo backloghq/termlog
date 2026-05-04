@@ -13,6 +13,20 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - `SegmentReader.docLenEntries()` — exposes the sidecar's `(docId, length)` pairs for compaction without decoding posting lists.
 - Docids append-only journal: `docids.log` (JSONL delta log of add/rm entries) replaces full-rewrite `docids.json` on each flush; `docids.snap` (full snapshot) written on close. Load path: snap → log replay → legacy `docids.json` fallback for backward compatibility.
 - Three journal tests: log written after flush, log replay on crash-reopen (lock deleted to simulate crash), remove entries appear in log.
+- `ManifestVersionError` class — dedicated error for unsupported manifest version, with `found` and `expected` fields (previously a generic `ManifestCorruptionError`).
+- `DEFAULT_FLUSH_THRESHOLD` exported named constant (1000); previously a magic literal.
+- `VERSION` constant now sourced from `package.json` at build time via JSON import attribute; no longer a manually maintained literal.
+- `@internal` JSDoc tags on all low-level exports (codec, term-dict, segment, manager internals, query, scoring) so api-extractor can strip them from the public API surface.
+- Structured public fields on error classes: `ManifestCorruptionError.detail`, `MappingCorruptionError.detail`, `TokenizerMismatchError.persisted` / `.runtime`.
+- `ManifestVersionError` exported from `src/index.ts`.
+- NFD normalization test, remove-then-re-add same docId test, mid-compaction crash test, `VERSION` export assertion.
+
+### Changed
+- `ManifestVersionError` is now thrown (instead of `ManifestCorruptionError`) when the manifest's `version` field does not match `MANIFEST_VERSION`.
+- `BM25Ranker` class-level and `score()` JSDoc updated to document the `mode` parameter and AND semantics.
+- `TermLog` module-level JSDoc updated to describe the docids journal/snapshot pattern (replaces stale `docids.json` reference).
+- `StorageBackend` module doc no longer claims to mirror opslog's interface.
+- README BM25 score example corrected from `0.693` to `0.655` (the idf alone is `ln(2) ≈ 0.693` but the full BM25 score is lower after length normalization).
 
 ### Fixed
 - `FsBackend.writeBlob` now fsyncs the data file before rename and the parent directory after rename — ensures both file content and directory entry survive power failure.

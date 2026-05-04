@@ -25,7 +25,9 @@ export class UnicodeTokenizer implements Tokenizer {
   }
 
   tokenize(text: string): string[] {
-    const tokens = text.toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? [];
+    // Normalize to NFC so that NFD-encoded input (e.g. "café") and
+    // NFC-encoded input ("café") produce identical tokens.
+    const tokens = text.normalize("NFC").toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? [];
     return tokens.filter((t) => t.length >= this.minLen);
   }
 }

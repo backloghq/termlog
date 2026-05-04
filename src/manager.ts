@@ -59,13 +59,25 @@ const MANIFEST_VERSION = 1;
 const MANIFEST_FILE = "manifest.json";
 const MANIFEST_TMP = "manifest.tmp";
 const LOCK_FILE = ".lock";
+export const DEFAULT_FLUSH_THRESHOLD = 1000;
 const DEFAULT_MERGE_THRESHOLD = 8;
 
-/** Thrown when manifest.json exists but cannot be parsed (scenario 5). */
+/** Thrown when manifest.json exists but cannot be parsed. */
 export class ManifestCorruptionError extends Error {
-  constructor(detail: string) {
+  constructor(public readonly detail: string) {
     super(`Manifest corruption: ${detail}`);
     this.name = "ManifestCorruptionError";
+  }
+}
+
+/** Thrown when the manifest's `version` field is not the version this code supports. */
+export class ManifestVersionError extends Error {
+  constructor(
+    public readonly found: number,
+    public readonly expected: number,
+  ) {
+    super(`Unsupported manifest version ${found} (expected ${expected})`);
+    this.name = "ManifestVersionError";
   }
 }
 
@@ -149,7 +161,7 @@ export class SegmentManager {
   static async open(opts: SegmentManagerOpts): Promise<SegmentManager> {
     const mgr = new SegmentManager(
       opts.backend,
-      opts.flushThreshold ?? 1000,
+      opts.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD,
       opts.mergeThreshold ?? DEFAULT_MERGE_THRESHOLD,
       opts.tokenizer ?? { kind: "unicode", minLen: 1 },
       opts.onBeforeManifest,
@@ -237,9 +249,7 @@ export class SegmentManager {
     }
 
     if (manifest.version !== MANIFEST_VERSION) {
-      throw new ManifestCorruptionError(
-        `unsupported manifest version ${manifest.version} (expected ${MANIFEST_VERSION})`,
-      );
+      throw new ManifestVersionError(manifest.version, MANIFEST_VERSION);
     }
 
     this._manifestLoaded = true;

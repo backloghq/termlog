@@ -4,8 +4,10 @@
  * Adds string↔number docId mapping, automatic tokenization, and BM25 search.
  * The SegmentManager, BM25Ranker, etc. are still exported for advanced callers.
  *
- * docIds mapping is persisted in `docids.json` alongside `manifest.json`.
- * The mapping is written atomically alongside the manifest after each flush.
+ * The docId mapping is persisted as an append-only journal (`docids.log`) with
+ * periodic snapshots (`docids.snap`). The log is appended before each manifest
+ * commit so the two are always consistent. On close the log is collapsed into
+ * the snapshot.
  */
 
 import { SegmentManager } from "./manager.js";
@@ -19,14 +21,17 @@ const DOCIDS_SNAP = "docids.snap";
 const DOCIDS_LOG  = "docids.log";
 
 export class MappingCorruptionError extends Error {
-  constructor(detail: string) {
+  constructor(public readonly detail: string) {
     super(`DocId mapping corruption: ${detail}`);
     this.name = "MappingCorruptionError";
   }
 }
 
 export class TokenizerMismatchError extends Error {
-  constructor(persisted: string, runtime: string) {
+  constructor(
+    public readonly persisted: string,
+    public readonly runtime: string,
+  ) {
     super(`Tokenizer mismatch: index was built with "${persisted}" but opened with "${runtime}"`);
     this.name = "TokenizerMismatchError";
   }

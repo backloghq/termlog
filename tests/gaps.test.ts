@@ -15,7 +15,7 @@ import { FsBackend } from "../src/storage.js";
 import { SegmentWriter, SegmentReader } from "../src/segment.js";
 import { TermDict } from "../src/term-dict.js";
 import { TermLog } from "../src/termlog.js";
-import { SegmentManager } from "../src/manager.js";
+import { SegmentManager, ManifestVersionError } from "../src/manager.js";
 import { UnicodeTokenizer } from "../src/tokenizer.js";
 import type { Tokenizer } from "../src/tokenizer.js";
 
@@ -225,6 +225,15 @@ describe("UnicodeTokenizer", () => {
   it("kind is 'unicode'", () => {
     expect(tok.kind).toBe("unicode");
   });
+
+  it("NFD and NFC forms of the same word produce identical tokens (#05e32294)", () => {
+    // "café" in NFC (U+00E9) vs NFD (e + combining acute U+0301)
+    const nfc = "café";          // precomposed é
+    const nfd = "café";         // decomposed e + combining acute
+    expect(tok.tokenize(nfc)).toEqual(tok.tokenize(nfd));
+    // Both should produce ["café"] in NFC form.
+    expect(tok.tokenize(nfd)).toEqual(["café"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -323,8 +332,10 @@ describe("manifest version validation", () => {
     manifest["version"] = 99;
     await backend.writeBlob("manifest.json", Buffer.from(JSON.stringify(manifest), "utf8"));
 
-    await expect(SegmentManager.open({ backend, dir }))
-      .rejects.toMatchObject({ name: "ManifestCorruptionError" });
+    const err = await SegmentManager.open({ backend, dir }).catch((e) => e);
+    expect(err).toBeInstanceOf(ManifestVersionError);
+    expect(err.found).toBe(99);
+    expect(err.expected).toBe(1);
   });
 });
 

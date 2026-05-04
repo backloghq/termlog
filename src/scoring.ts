@@ -51,11 +51,15 @@ export function bm25Score(
 }
 
 /**
- * BM25 ranker — wraps the OR query iterator and scores each candidate document.
+ * BM25 ranker — wraps the boolean query iterators and scores each candidate document.
  *
  * Usage:
  *   const ranker = new BM25Ranker({ k1: 1.2, b: 0.75 });
- *   const results = ranker.score(terms, segments, N, totalLen, limit);
+ *   const results = ranker.score(terms, segments, N, totalLen, limit, "or");
+ *
+ * Supports two modes:
+ *   - "or"  (default) — union: every docId matching any term is scored.
+ *   - "and"           — intersection: only docIds present in every term's posting list.
  *
  * The caller must supply `N` (total doc count) and `totalLen` (sum of all doc
  * lengths) because those statistics live in the manifest, not in individual
@@ -71,15 +75,15 @@ export class BM25Ranker {
   }
 
   /**
-   * Score all documents matching any of `terms` using OR semantics.
-   * Returns results sorted by score desc, ties broken by docId asc
-   * (mirrors agentdb's sort order).
+   * Score documents matching `terms` using the specified boolean mode.
+   * Returns results sorted by score desc, ties broken by string-lexicographic docId asc.
    *
    * @param terms    - query terms (pre-tokenized)
    * @param segments - segment readers to search
    * @param N        - total indexed document count
    * @param totalLen - sum of all document lengths
-   * @param limit    - optional cap on results
+   * @param limit    - optional cap on results (applied after sorting)
+   * @param mode     - "or" (default) for union, "and" for intersection
    */
   score(
     terms: string[],

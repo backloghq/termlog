@@ -218,3 +218,29 @@ describe("compact — auto-trigger via mergeThreshold", () => {
     expect(mgr.segments()).toHaveLength(1);
   });
 });
+
+describe("compact — mid-compaction crash recovery (#6bcb7e46)", () => {
+  it("orphaned merged segment file is cleaned up on reopen after manifest was not committed", async () => {
+    // Build 3 segments.
+    const mgr = await buildIndex(3);
+    const segIdsBeforeCompact = mgr.segments().map((_, i) => `seg-${String(i).padStart(6, "0")}`);
+
+    // Simulate crash mid-compaction: a merged segment file exists on disk but
+    // the manifest was NOT updated (old manifest still references the 3 originals).
+    // We emulate this by writing a fake orphaned segment blob then reopening.
+    await backend.writeBlob("seg-999999.seg", Buffer.from("orphan"));
+    await mgr.close();
+
+    // Reopen: recoverOrphans() must delete seg-999999.seg (not in manifest).
+    const mgr2 = await SegmentManager.open({ backend, dir });
+    const blobs = await backend.listBlobs("seg-");
+    expect(blobs).not.toContain("seg-999999.seg");
+    // The 3 original segments are still referenced and intact.
+    expect(mgr2.segments()).toHaveLength(3);
+    for (const id of segIdsBeforeCompact) {
+      const { docIds } = mgr2.segments()[segIdsBeforeCompact.indexOf(id)].decodePostings("common");
+      expect(docIds).toHaveLength(1);
+    }
+    await mgr2.close();
+  });
+});
