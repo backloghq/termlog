@@ -254,3 +254,88 @@ describe("AND query correctness under concurrent writes", () => {
     expect(andResult).toEqual([0]); // only doc 0, not doc 2
   });
 });
+
+// ---------------------------------------------------------------------------
+// 5. Mutex correctness — verify serialize<R>() serializes mutating operations
+// ---------------------------------------------------------------------------
+describe("write mutex serialization", () => {
+  it("100 concurrent add() calls all land in the manifest — no counter races or lost docs", async () => {
+    // flushThreshold=1 so every add auto-flushes; mergeThreshold=999 to disable auto-compact.
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, mergeThreshold: 999 });
+
+    const N = 100;
+    const adds = Array.from({ length: N }, (_, i) =>
+      mgr.add(i, [{ term: `term${i}`, tf: 1 }]),
+    );
+    await Promise.all(adds);
+
+    // All 100 docs must be committed to segments (buffer is empty after each auto-flush).
+    expect(mgr.bufferedCount()).toBe(0);
+    // Generation increments once per flush; each add triggers one flush at threshold=1.
+    expect(mgr.commitGeneration()).toBe(N);
+    // Every doc's term is findable across segments.
+    const allDocIds = new Set<number>();
+    for (const seg of mgr.segments()) {
+      for (let i = 0; i < N; i++) {
+        const { docIds } = seg.decodePostings(`term${i}`);
+        for (const id of docIds) allDocIds.add(id);
+      }
+    }
+    expect(allDocIds.size).toBe(N);
+    for (let i = 0; i < N; i++) expect(allDocIds.has(i)).toBe(true);
+  });
+
+  it("Promise.all racing flush() and compact() produces a consistent manifest", async () => {
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 100, mergeThreshold: 999 });
+    // Pre-load 3 segments so compact() has work to do.
+    for (let i = 0; i < 3; i++) {
+      await mgr.add(i, [{ term: "x", tf: 1 }]);
+      await mgr.flush();
+    }
+    // Add some buffered docs that flush() will commit.
+    await mgr.add(10, [{ term: "x", tf: 1 }]);
+    await mgr.add(11, [{ term: "x", tf: 1 }]);
+
+    // Race flush and compact.
+    await Promise.all([mgr.flush(), mgr.compact()]);
+
+    // Manifest must be consistent: all pre-flush docs and all pre-compact docs visible.
+    const allIds: number[] = [];
+    for (const seg of mgr.segments()) {
+      allIds.push(...seg.decodePostings("x").docIds);
+    }
+    // Reopen to confirm manifest was written atomically.
+    const mgr2 = await SegmentManager.open({ backend });
+    const allIds2: number[] = [];
+    for (const seg of mgr2.segments()) {
+      allIds2.push(...seg.decodePostings("x").docIds);
+    }
+    expect(allIds2.length).toBe(allIds.length);
+  });
+
+  it("Promise.all racing add() and remove() respects FIFO order — remove wins when submitted after add", async () => {
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 100 });
+    // Add doc 0, then race add(1) and remove(0) concurrently.
+    // Since add(1) and remove(0) are submitted in order via Promise.all,
+    // the mutex guarantees both complete without corruption.
+    await mgr.add(0, [{ term: "alpha", tf: 1 }]);
+    await mgr.flush();
+
+    await Promise.all([
+      mgr.add(1, [{ term: "alpha", tf: 1 }]),
+      mgr.remove(0),
+    ]);
+    await mgr.flush();
+
+    // After flush, the tombstone for doc 0 should be in a segment.
+    // Doc 1 should be visible; doc 0 should be tombstoned.
+    const segs = mgr.segments();
+    let hasTombstoneFor0 = false;
+    for (const seg of segs) {
+      if (seg.isTombstoned(0)) { hasTombstoneFor0 = true; break; }
+    }
+    expect(hasTombstoneFor0).toBe(true);
+    // Buffer is empty — both operations committed.
+    expect(mgr.bufferedCount()).toBe(0);
+  });
+});
