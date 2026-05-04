@@ -460,6 +460,9 @@ describe("S3StorageAdapter — createWriteStream multipart", () => {
     };
     const adapter = new S3StorageAdapter({ client, commands: cmdsWithout, bucket: "b", prefix: "p/" });
 
-    await expect(adapter.createWriteStream("obj.seg")).rejects.toThrow(/requires CreateMultipartUploadCommand/);
+    await expect(adapter.createWriteStream("obj.seg")).rejects.toMatchObject({
+      name: "WriteStreamError",
+      message: expect.stringMatching(/requires CreateMultipartUploadCommand/),
+    });
   });
 });

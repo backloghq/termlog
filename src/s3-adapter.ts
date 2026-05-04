@@ -25,6 +25,7 @@
  */
 
 import type { StorageBackend, BlobWriteStream } from "./storage.js";
+import { WriteStreamError } from "./storage.js";
 
 /** Minimal S3 operation shapes — compatible with AWS SDK v3 and equivalents. */
 export interface S3GetObjectOutput {
@@ -183,7 +184,7 @@ export class S3StorageAdapter implements StorageBackend {
   async createWriteStream(path: string): Promise<BlobWriteStream> {
     const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, PutObjectCommand } = this.commands;
     if (!CreateMultipartUploadCommand || !UploadPartCommand || !CompleteMultipartUploadCommand || !AbortMultipartUploadCommand) {
-      throw new Error(
+      throw new WriteStreamError(
         "S3StorageAdapter.createWriteStream requires CreateMultipartUploadCommand, UploadPartCommand, " +
         "CompleteMultipartUploadCommand, and AbortMultipartUploadCommand in the commands object.",
       );

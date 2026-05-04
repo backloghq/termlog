@@ -20,6 +20,14 @@ export interface BlobWriteStream {
   abort(): Promise<void>;
 }
 
+/** Thrown when a StorageBackend cannot open or complete a streaming write. */
+export class WriteStreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WriteStreamError";
+  }
+}
+
 export interface StorageBackend {
   readBlob(path: string): Promise<Buffer>;
   writeBlob(path: string, data: Buffer): Promise<void>;

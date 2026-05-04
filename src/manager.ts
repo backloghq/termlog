@@ -625,11 +625,7 @@ export class SegmentManager {
         }
       }
       await flushTerm();
-
-      // Source reader Buffers are no longer needed after the heap is exhausted.
-      // Nulling the array ref lets GC reclaim postingsRegion Buffers before finish().
       toMergeReaders.length = 0;
-
       await writer.finish();
     } catch (err) {
       await stream.abort().catch(() => undefined);

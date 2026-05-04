@@ -12,7 +12,7 @@ export { UnicodeTokenizer, DEFAULT_TOKENIZER } from "./tokenizer.js";
 
 // Storage
 export type { StorageBackend, BlobWriteStream } from "./storage.js";
-export { FsBackend } from "./storage.js";
+export { FsBackend, WriteStreamError } from "./storage.js";
 
 /**
  * @internal Low-level building blocks — not covered by semver stability guarantees.

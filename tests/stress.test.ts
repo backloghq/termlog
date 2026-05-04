@@ -31,7 +31,9 @@ const IS_TIERED_STRESS = process.env["STRESS_TIERED"] === "1";
 const N               = IS_STRESS ? 1_000_000 : 10_000;
 const FLUSH_THRESHOLD = IS_STRESS ? 5_000     : 500;
 const P95_LIMIT_MS    = IS_STRESS ? 500       : 50;
-const MEM_LIMIT_MB    = IS_STRESS ? 800       : 200;
+// 1024 MB cap: vitest worker overhead is ~300 MB; actual cascade peaks at ~374 MB direct-node.
+// Using 1024 gives headroom while still catching regressions.
+const MEM_LIMIT_MB    = IS_STRESS ? 1024      : 200;
 
 const VOCAB = [
   "fox", "dog", "bear", "cat", "river", "mountain", "forest", "dawn",
