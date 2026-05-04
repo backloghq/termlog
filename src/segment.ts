@@ -32,8 +32,8 @@
 
 import { encodePostings, decodePostings, postingIterator } from "./codec.js";
 import { TermDict } from "./term-dict.js";
-import { crc32 } from "./crc32.js";
-import type { StorageBackend } from "./storage.js";
+import { crc32, Crc32Stream } from "./crc32.js";
+import type { StorageBackend, WriteStream } from "./storage.js";
 import type { Posting } from "./codec.js";
 import type { DictEntry } from "./term-dict.js";
 
@@ -48,126 +48,149 @@ export class SegmentCorruptionError extends Error {
   }
 }
 
-/** Accumulated state for one term during segment construction. */
-interface TermAccumulator {
-  docIds: number[];
-  tfs: number[];
-}
-
 /**
- * Builds a segment from a stream of (term, docId, tf) calls.
- * Call `addPosting` in any order. `flush` sorts, encodes, and writes atomically.
- * Optionally include a tombstone set for doc IDs removed from prior segments.
+ * Streaming segment writer. Postings are encoded and written to the stream
+ * immediately as each term arrives — no in-memory accumulation of the full
+ * postings region. Only the term dictionary entries (one small record per distinct
+ * term) and doc-length sidecar are held in memory.
+ *
+ * Usage:
+ *   const stream = await backend.createWriteStream(`${id}.seg`);
+ *   const writer = new SegmentWriter(stream);
+ *   // For each term in lex-sorted order:
+ *   await writer.writeTerm(term, sortedDocIds, sortedTfs);
+ *   // Set doc lengths (can be called before writeTerm calls):
+ *   writer.setDocLength(docId, length);
+ *   writer.setTombstones(sortedDocIds);
+ *   // Commit:
+ *   await writer.finish();
  */
 export class SegmentWriter {
-  private readonly termMap = new Map<string, TermAccumulator>();
-  private readonly docLengths = new Map<number, number>();
-  private tombstones: number[] = [];
-
-  addPosting(term: string, docId: number, tf: number): void {
-    let acc = this.termMap.get(term);
-    if (!acc) { acc = { docIds: [], tfs: [] }; this.termMap.set(term, acc); }
-    acc.docIds.push(docId);
-    acc.tfs.push(tf);
-  }
-
-  /** Record the token count (length) for a document. Required for BM25 normalization. */
-  setDocLength(docId: number, length: number): void {
-    this.docLengths.set(docId, length);
-  }
-
-  /** Set tombstones — sorted array of doc IDs removed from prior segments. */
-  setTombstones(docIds: number[]): void {
-    this.tombstones = [...docIds].sort((a, b) => a - b);
-  }
-
-  get termCount(): number { return this.termMap.size; }
-  get docCount(): number { return this.docLengths.size; }
+  private readonly stream: WriteStream;
+  /** Running CRC32 over the postings region — updated as each term is streamed. */
+  private readonly postingsCrc = new Crc32Stream();
+  /** Dictionary entries accumulated during writeTerm calls. */
+  private readonly dictEntries: Array<{ term: string; postingsOffset: number; postingsLength: number; df: number }> = [];
+  /** Running byte offset within the postings region. */
+  private postingsOffset = 0;
 
   /**
-   * Serialize and write to backend as `<id>.seg` atomically.
-   * Returns the path written.
+   * Packed sidecar: interleaved [docId, len, docId, len, ...] in uint32 pairs.
+   * Grows with doubling-style reallocation. 8 bytes/doc vs ~64-80 for Map.
    */
-  async flush(id: string, backend: StorageBackend): Promise<string> {
-    const segPath = `${id}.seg`;
+  private sidecarArr = new Uint32Array(64); // initial capacity: 32 docs
+  private sidecarCount = 0;
 
-    // --- Postings region ---
-    const postingBuffers: Buffer[] = [];
-    const dictMap = new Map<string, { postingsOffset: number; postingsLength: number; df: number }>();
-    let postingsOffset = 0;
+  private tombstonesArr: number[] = [];
 
-    const sortedTerms = [...this.termMap.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
-    for (const [term, acc] of sortedTerms) {
-      const order = acc.docIds.map((_, i) => i).sort((a, b) => acc.docIds[a] - acc.docIds[b]);
-      const sortedIds = order.map((i) => acc.docIds[i]);
-      const sortedTfs = order.map((i) => acc.tfs[i]);
+  constructor(stream: WriteStream) {
+    this.stream = stream;
+  }
 
-      const buf = encodePostings(sortedIds, sortedTfs);
-      postingBuffers.push(buf);
-      dictMap.set(term, { postingsOffset, postingsLength: buf.length, df: new Set(sortedIds).size });
-      postingsOffset += buf.length;
+  /**
+   * Write one term's postings. docIds MUST be in ascending order.
+   * Terms MUST be called in lex-sorted order.
+   */
+  async writeTerm(term: string, sortedDocIds: number[], sortedTfs: number[]): Promise<void> {
+    const buf = encodePostings(sortedDocIds, sortedTfs);
+    this.postingsCrc.update(buf);
+    await this.stream.write(buf);
+    this.dictEntries.push({
+      term,
+      postingsOffset: this.postingsOffset,
+      postingsLength: buf.length,
+      df: sortedDocIds.length,
+    });
+    this.postingsOffset += buf.length;
+  }
+
+  setDocLength(docId: number, length: number): void {
+    // Grow with ~1.5× doubling if needed (two uint32 slots per entry).
+    if (this.sidecarCount * 2 >= this.sidecarArr.length) {
+      const next = new Uint32Array(Math.ceil(this.sidecarArr.length * 1.5));
+      next.set(this.sidecarArr);
+      this.sidecarArr = next;
     }
-    const postingsRegion = Buffer.concat(postingBuffers);
+    this.sidecarArr[this.sidecarCount * 2]     = docId;
+    this.sidecarArr[this.sidecarCount * 2 + 1] = length;
+    this.sidecarCount++;
+  }
+
+  setTombstones(docIds: number[]): void {
+    this.tombstonesArr = [...docIds].sort((a, b) => a - b);
+  }
+
+  get termCount(): number { return this.dictEntries.length; }
+  get docCount(): number { return this.sidecarCount; }
+
+  /**
+   * Write sidecar, tombstones, term dictionary, footer, then commit the stream.
+   * After finish() the stream is closed; do not call writeTerm after finish().
+   */
+  async finish(): Promise<void> {
+    const postingsLen = this.postingsOffset;
 
     // --- Doc-length sidecar ---
-    // Format: uint32 docCount, then [uint32 docId, uint32 length] * docCount
-    const docIds = [...this.docLengths.keys()].sort((a, b) => a - b);
-    const sidecarBuf = Buffer.allocUnsafe(4 + docIds.length * 8);
-    sidecarBuf.writeUInt32LE(docIds.length, 0);
-    for (let i = 0; i < docIds.length; i++) {
-      sidecarBuf.writeUInt32LE(docIds[i], 4 + i * 8);
-      sidecarBuf.writeUInt32LE(this.docLengths.get(docIds[i])!, 4 + i * 8 + 4);
+    // Sort by docId ascending (caller may not have added in order).
+    const pairs: Array<[number, number]> = [];
+    for (let i = 0; i < this.sidecarCount; i++) {
+      pairs.push([this.sidecarArr[i * 2], this.sidecarArr[i * 2 + 1]]);
     }
+    pairs.sort((a, b) => a[0] - b[0]);
+
+    const sidecarBuf = Buffer.allocUnsafe(4 + pairs.length * 8);
+    sidecarBuf.writeUInt32LE(pairs.length, 0);
+    for (let i = 0; i < pairs.length; i++) {
+      sidecarBuf.writeUInt32LE(pairs[i][0], 4 + i * 8);
+      sidecarBuf.writeUInt32LE(pairs[i][1], 4 + i * 8 + 4);
+    }
+    const sidecarCrc = crc32(sidecarBuf);
 
     // --- Tombstones region ---
-    // Format: uint32 count, then uint32[count] sorted doc IDs
-    const sortedTombstones = this.tombstones;
-    const tombstonesBuf = Buffer.allocUnsafe(4 + sortedTombstones.length * 4);
-    tombstonesBuf.writeUInt32LE(sortedTombstones.length, 0);
-    for (let i = 0; i < sortedTombstones.length; i++) {
-      tombstonesBuf.writeUInt32LE(sortedTombstones[i], 4 + i * 4);
+    const tombstonesBuf = Buffer.allocUnsafe(4 + this.tombstonesArr.length * 4);
+    tombstonesBuf.writeUInt32LE(this.tombstonesArr.length, 0);
+    for (let i = 0; i < this.tombstonesArr.length; i++) {
+      tombstonesBuf.writeUInt32LE(this.tombstonesArr[i], 4 + i * 4);
     }
+    const tombstonesCrc = crc32(tombstonesBuf);
 
     // --- Term dictionary ---
+    const dictMap = new Map<string, { postingsOffset: number; postingsLength: number; df: number }>();
+    for (const e of this.dictEntries) dictMap.set(e.term, e);
     const dict = TermDict.fromMap(dictMap);
     const dictBuf = dict.serialize();
-
-    // --- CRC32s ---
-    const postingsCrc  = crc32(postingsRegion);
-    const sidecarCrc   = crc32(sidecarBuf);
-    const tombstonesCrc = crc32(tombstonesBuf);
-    const dictCrc      = crc32(dictBuf);
+    const dictCrc = crc32(dictBuf);
 
     // --- Footer ---
-    const sidecarOffset     = postingsRegion.length;
-    const tombstonesOffset  = sidecarOffset + sidecarBuf.length;
-    const dictOffset        = tombstonesOffset + tombstonesBuf.length;
+    const sidecarOffset    = postingsLen;
+    const tombstonesOffset = sidecarOffset + sidecarBuf.length;
+    const dictOffset       = tombstonesOffset + tombstonesBuf.length;
 
     const footer = Buffer.allocUnsafe(FOOTER_SIZE);
     let fo = 0;
-    footer.writeUInt32LE(SEGMENT_MAGIC,           fo); fo += 4;
-    footer.writeUInt32LE(SEGMENT_VERSION,         fo); fo += 4;
-    footer.writeUInt32LE(0,                       fo); fo += 4; // postingsOffset (always 0)
-    footer.writeUInt32LE(postingsRegion.length,   fo); fo += 4;
-    footer.writeUInt32LE(sidecarOffset,           fo); fo += 4;
-    footer.writeUInt32LE(sidecarBuf.length,       fo); fo += 4;
-    footer.writeUInt32LE(tombstonesOffset,        fo); fo += 4;
-    footer.writeUInt32LE(tombstonesBuf.length,    fo); fo += 4;
-    footer.writeUInt32LE(dictOffset,              fo); fo += 4;
-    footer.writeUInt32LE(dictBuf.length,          fo); fo += 4;
-    footer.writeUInt32LE(postingsCrc,             fo); fo += 4;
-    footer.writeUInt32LE(sidecarCrc,              fo); fo += 4;
-    footer.writeUInt32LE(tombstonesCrc,           fo); fo += 4;
-    footer.writeUInt32LE(dictCrc,                 fo); fo += 4;
-    footer.writeUInt32LE(docIds.length,           fo); fo += 4;
-    footer.writeUInt32LE(dict.size,               fo);
+    footer.writeUInt32LE(SEGMENT_MAGIC,         fo); fo += 4;
+    footer.writeUInt32LE(SEGMENT_VERSION,       fo); fo += 4;
+    footer.writeUInt32LE(0,                     fo); fo += 4; // postingsOffset (always 0)
+    footer.writeUInt32LE(postingsLen,           fo); fo += 4;
+    footer.writeUInt32LE(sidecarOffset,         fo); fo += 4;
+    footer.writeUInt32LE(sidecarBuf.length,     fo); fo += 4;
+    footer.writeUInt32LE(tombstonesOffset,      fo); fo += 4;
+    footer.writeUInt32LE(tombstonesBuf.length,  fo); fo += 4;
+    footer.writeUInt32LE(dictOffset,            fo); fo += 4;
+    footer.writeUInt32LE(dictBuf.length,        fo); fo += 4;
+    footer.writeUInt32LE(this.postingsCrc.digest(), fo); fo += 4;
+    footer.writeUInt32LE(sidecarCrc,            fo); fo += 4;
+    footer.writeUInt32LE(tombstonesCrc,         fo); fo += 4;
+    footer.writeUInt32LE(dictCrc,               fo); fo += 4;
+    footer.writeUInt32LE(pairs.length,          fo); fo += 4;
+    footer.writeUInt32LE(dict.size,             fo);
 
-    const segData = Buffer.concat([postingsRegion, sidecarBuf, tombstonesBuf, dictBuf, footer]);
-
-    // FsBackend.writeBlob is already atomic (nonce-tmp → rename).
-    await backend.writeBlob(segPath, segData);
-
-    return segPath;
+    // Stream remaining regions and commit.
+    await this.stream.write(sidecarBuf);
+    await this.stream.write(tombstonesBuf);
+    await this.stream.write(dictBuf);
+    await this.stream.write(footer);
+    await this.stream.end();
   }
 }
 
