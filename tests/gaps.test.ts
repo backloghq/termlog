@@ -252,4 +252,16 @@ describe("tokenizer kind persistence", () => {
     expect(results.map((r) => r.docId)).toContain("doc-a");
     await tl2.close();
   });
+
+  it("TokenizerMismatchError when reopening with same kind but different minLen", async () => {
+    const tok1 = new UnicodeTokenizer(1);
+    const tl1 = await TermLog.open({ dir, backend, tokenizer: tok1, flushThreshold: 100 });
+    await tl1.add("doc-a", "hello world");
+    await tl1.close();
+
+    const tok3 = new UnicodeTokenizer(3);
+    await expect(
+      TermLog.open({ dir, backend, tokenizer: tok3, flushThreshold: 100 }),
+    ).rejects.toMatchObject({ name: "TokenizerMismatchError" });
+  });
 });

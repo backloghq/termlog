@@ -85,12 +85,21 @@ export class TermLog {
       onBeforeManifest: () => box.tl!.saveDocIds(),
     });
 
-    // When reopening an existing index, validate that the persisted tokenizer kind
+    // When reopening an existing index, validate that the persisted tokenizer config
     // matches the runtime tokenizer. Fresh indexes have no manifest to check against.
-    const persisted = mgr.persistedTokenizerKind;
-    if (persisted !== null && persisted !== tokenizer.kind) {
+    const persistedKind = mgr.persistedTokenizerKind;
+    const persistedMinLen = mgr.persistedTokenizerMinLen;
+    const runtimeMinLen = tokenizer.minLen ?? 1;
+    if (persistedKind !== null && persistedKind !== tokenizer.kind) {
       await mgr.close();
-      throw new TokenizerMismatchError(persisted, tokenizer.kind);
+      throw new TokenizerMismatchError(persistedKind, tokenizer.kind);
+    }
+    if (persistedMinLen !== null && persistedMinLen !== runtimeMinLen) {
+      await mgr.close();
+      throw new TokenizerMismatchError(
+        `${persistedKind}(minLen=${persistedMinLen})`,
+        `${tokenizer.kind}(minLen=${runtimeMinLen})`,
+      );
     }
 
     const tl = new TermLog(mgr, tokenizer, backend, opts.k1 ?? 1.2, opts.b ?? 0.75);
