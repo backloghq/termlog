@@ -109,14 +109,9 @@ export class BM25Ranker {
     const scores = new Map<number, number>();
     const queryIter = mode === "and" ? andQuery(terms, segments) : orQuery(terms, segments);
 
-    for (const { docId, tfs } of queryIter) {
+    for (const { docId, tfs, segIndex } of queryIter) {
       let docScore = 0;
-      // Look up dl: docLen lives in the segment that contains this docId.
-      let dl = 0;
-      for (const seg of segments) {
-        const l = seg.docLen(docId);
-        if (l > 0) { dl = l; break; }
-      }
+      const dl = segments[segIndex]?.docLen(docId) ?? 0;
 
       for (const [term, tf] of tfs) {
         if (!tf) continue; // skip tf=0 placeholders (mirrors agentdb)

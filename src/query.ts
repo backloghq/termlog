@@ -15,6 +15,7 @@
  * Tombstoned doc IDs are filtered at the MultiSegmentIter level.
  */
 
+import { MinHeap } from "./heap.js";
 import type { SegmentReader } from "./segment.js";
 import type { Posting } from "./codec.js";
 
@@ -22,6 +23,12 @@ export interface QueryPosting {
   docId: number;
   /** Per-term tf values, keyed by term (for BM25 scoring layer). */
   tfs: Map<string, number>;
+  /**
+   * Index of the segment that owns this docId (into the segments[] array passed
+   * to andQuery/orQuery). Enables O(1) docLen lookup in the scoring layer
+   * instead of scanning all segments.
+   */
+  segIndex: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,70 +103,96 @@ export function buildTombstoneSet(segments: SegmentReader[]): Set<number> {
 // Multi-segment iterator for one term (k-way merge)
 // ---------------------------------------------------------------------------
 
+/** One active entry in the MultiSegmentIter heap. */
+interface HeapSlot {
+  docId: number;
+  segIndex: number;
+  iter: SegmentPostingIter;
+}
+
 /**
  * Merges per-segment SegmentPostingIters for a single term by docId order.
- * Uses a simple linear scan over active iterators (k is small for v0.1;
- * a binary heap can be added in v0.2 for large segment counts).
+ * Uses a MinHeap (O(log K) per step) instead of a linear scan (O(K)).
  * Tombstoned docIds (from the provided set) are skipped transparently.
  */
 export class MultiSegmentIter {
   readonly term: string;
+  private readonly tombstones: Set<number>;
+  private readonly heap: MinHeap<HeapSlot>;
+  /** All iters, indexed by segIndex — needed for seek(). */
   private readonly iters: SegmentPostingIter[];
-  private readonly tombstones: Set<number> = new Set();
 
   constructor(term: string, segments: SegmentReader[], tombstones?: Set<number>) {
     this.term = term;
     this.tombstones = tombstones ?? new Set();
-    this.iters = segments.map((seg) => new SegmentPostingIter(seg.postings(term)));
-    // Advance past any tombstoned entries at the head of each iterator.
-    for (const it of this.iters) this.skipTombstones(it);
+    this.heap = new MinHeap<HeapSlot>((a, b) => a.docId - b.docId);
+    this.iters = segments.map((seg, si) => {
+      const it = new SegmentPostingIter(seg.postings(term));
+      this.advancePastTombstones(it);
+      if (!it.isExhausted && it.docId !== null) {
+        this.heap.push({ docId: it.docId, segIndex: si, iter: it });
+      }
+      return it;
+    });
   }
 
-  private skipTombstones(it: SegmentPostingIter): void {
+  private advancePastTombstones(it: SegmentPostingIter): void {
     while (!it.isExhausted && it.docId !== null && this.tombstones.has(it.docId)) {
       it.advance();
     }
   }
 
   get isExhausted(): boolean {
-    return this.iters.every((it) => it.isExhausted);
+    return this.heap.size === 0;
   }
 
   /** The smallest current docId across all active iterators, or null if exhausted. */
   get currentDocId(): number | null {
-    let min: number | null = null;
-    for (const it of this.iters) {
-      if (!it.isExhausted && it.docId !== null) {
-        if (min === null || it.docId < min) min = it.docId;
-      }
-    }
-    return min;
+    return this.heap.peek()?.docId ?? null;
   }
 
   /**
-   * Collect the tf for the current minimum docId (summing across segments that
-   * share the same docId, though in practice each docId lives in one segment).
-   * Advances all iterators that were at that docId, skipping past tombstones.
+   * Emit the posting for the current minimum docId, summing tf across any segments
+   * sharing that docId (rare in practice), and advance those iterators.
+   * Returns { docId, tf, segIndex } where segIndex is the segment with the lowest
+   * index that contributed (for O(1) docLen lookup).
    */
-  next(): { docId: number; tf: number } | null {
-    const docId = this.currentDocId;
-    if (docId === null) return null;
+  next(): { docId: number; tf: number; segIndex: number } | null {
+    const top = this.heap.peek();
+    if (!top) return null;
+    const docId = top.docId;
     let tf = 0;
-    for (const it of this.iters) {
-      if (!it.isExhausted && it.docId === docId) {
-        tf += it.tf;
-        it.advance();
-        this.skipTombstones(it);
+    let segIndex = top.segIndex;
+
+    // Drain all heap entries at this docId (handles the rare cross-segment duplicate).
+    while (this.heap.size > 0 && this.heap.peek()!.docId === docId) {
+      const slot = this.heap.pop()!;
+      tf += slot.iter.tf;
+      if (slot.segIndex < segIndex) segIndex = slot.segIndex;
+      slot.iter.advance();
+      this.advancePastTombstones(slot.iter);
+      if (!slot.iter.isExhausted && slot.iter.docId !== null) {
+        slot.docId = slot.iter.docId;
+        this.heap.push(slot);
       }
     }
-    return { docId, tf };
+    return { docId, tf, segIndex };
   }
 
-  /** Advance all iterators until their current docId >= target, skipping tombstones. */
+  /**
+   * Seek all iterators to the first docId >= target, rebuilding the heap.
+   * O(K log K) — used by andQuery's zigzag merge.
+   */
   seek(target: number): void {
-    for (const it of this.iters) {
+    // Drain heap, seek each iter, re-push if still alive.
+    while (this.heap.size > 0) this.heap.pop();
+    for (let si = 0; si < this.iters.length; si++) {
+      const it = this.iters[si];
       it.seek(target);
-      this.skipTombstones(it);
+      this.advancePastTombstones(it);
+      if (!it.isExhausted && it.docId !== null) {
+        this.heap.push({ docId: it.docId, segIndex: si, iter: it });
+      }
     }
   }
 }
@@ -189,34 +222,35 @@ export function* andQuery(
   const iters = terms.map((t) => new MultiSegmentIter(t, segments, tombstones));
 
   while (true) {
-    // Check exhaustion.
     if (iters.some((it) => it.isExhausted)) break;
 
-    // Find the maximum current docId.
+    // Find the maximum current docId (O(1) per iter via heap peek).
     let maxDocId = -1;
     for (const it of iters) {
       const id = it.currentDocId;
-      if (id === null) { return; }
+      if (id === null) return;
       if (id > maxDocId) maxDocId = id;
     }
 
     // Seek all iterators to maxDocId.
     for (const it of iters) it.seek(maxDocId);
 
-    // If any iterator is now exhausted or past maxDocId, loop.
     if (iters.some((it) => it.isExhausted)) break;
 
-    // Check if all iterators are exactly at maxDocId.
+    // Check if all iterators landed exactly on maxDocId.
     const allMatch = iters.every((it) => it.currentDocId === maxDocId);
     if (allMatch) {
       const tfs = new Map<string, number>();
+      let segIndex = 0;
       for (let i = 0; i < iters.length; i++) {
         const result = iters[i].next();
-        if (result) tfs.set(terms[i], result.tf);
+        if (result) {
+          tfs.set(terms[i], result.tf);
+          if (i === 0) segIndex = result.segIndex;
+        }
       }
-      yield { docId: maxDocId, tfs };
+      yield { docId: maxDocId, tfs, segIndex };
     }
-    // If not all match, the seek in the next iteration will advance the laggards.
   }
 }
 
@@ -236,7 +270,7 @@ export function* orQuery(
   const iters = terms.map((t) => new MultiSegmentIter(t, segments, tombstones));
 
   while (true) {
-    // Find the minimum current docId across all active iterators.
+    // Find the minimum current docId across all active iterators (O(1) per iter).
     let minDocId: number | null = null;
     for (const it of iters) {
       if (!it.isExhausted) {
@@ -244,17 +278,22 @@ export function* orQuery(
         if (id !== null && (minDocId === null || id < minDocId)) minDocId = id;
       }
     }
-    if (minDocId === null) break; // all exhausted
+    if (minDocId === null) break;
 
-    // Collect tfs from all iterators that are at minDocId.
+    // Collect tfs from all iterators at minDocId; capture segIndex from first match.
     const tfs = new Map<string, number>();
+    let segIndex = 0;
+    let segIndexSet = false;
     for (let i = 0; i < iters.length; i++) {
       const it = iters[i];
       if (!it.isExhausted && it.currentDocId === minDocId) {
         const result = it.next();
-        if (result) tfs.set(terms[i], result.tf);
+        if (result) {
+          tfs.set(terms[i], result.tf);
+          if (!segIndexSet) { segIndex = result.segIndex; segIndexSet = true; }
+        }
       }
     }
-    yield { docId: minDocId, tfs };
+    yield { docId: minDocId, tfs, segIndex };
   }
 }
