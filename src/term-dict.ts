@@ -55,15 +55,8 @@ export class TermDict {
   }
 
   /** Iterate all entries in sorted order. */
-  [Symbol.iterator](): Iterator<DictEntry> {
-    let i = 0;
-    const entries = this.entries;
-    return {
-      next(): IteratorResult<DictEntry> {
-        if (i >= entries.length) return { done: true, value: undefined as unknown as DictEntry };
-        return { done: false, value: entries[i++] };
-      },
-    };
+  *[Symbol.iterator](): Generator<DictEntry> {
+    for (const entry of this.entries) yield entry;
   }
 
   /** Serialize to a Buffer using the binary format described in the file header. */
