@@ -12,7 +12,7 @@ import { mkdir } from "node:fs/promises";
  * Chunks become visible at the target path only after `end()` resolves.
  * `abort()` discards the in-progress write and leaves nothing at the path.
  */
-export interface WriteStream {
+export interface BlobWriteStream {
   write(chunk: Buffer): Promise<void>;
   /** Atomically commits all written chunks to `path`. */
   end(): Promise<void>;
@@ -30,7 +30,7 @@ export interface StorageBackend {
    * buffered/streamed but not visible until `end()` commits atomically.
    * On error call `abort()` to clean up.
    */
-  createWriteStream(path: string): Promise<WriteStream>;
+  createWriteStream(path: string): Promise<BlobWriteStream>;
   /**
    * Append `data` to the end of `path`, creating it if absent.
    * Optional — callers fall back to read-modify-writeBlob on backends that omit this.
@@ -129,7 +129,7 @@ export class FsBackend implements StorageBackend {
     }
   }
 
-  async createWriteStream(path: string): Promise<WriteStream> {
+  async createWriteStream(path: string): Promise<BlobWriteStream> {
     const dest = this.abs(path);
     const dir = dirname(dest);
     await mkdir(dir, { recursive: true });

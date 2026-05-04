@@ -24,7 +24,7 @@
  * lock. You must ensure at most one writer per (bucket, prefix) combination.
  */
 
-import type { StorageBackend, WriteStream } from "./storage.js";
+import type { StorageBackend, BlobWriteStream } from "./storage.js";
 
 /** Minimal S3 operation shapes — compatible with AWS SDK v3 and equivalents. */
 export interface S3GetObjectOutput {
@@ -180,7 +180,7 @@ export class S3StorageAdapter implements StorageBackend {
   // appendBlob intentionally not implemented — S3 has no native append.
   // saveDocIds() falls back to read-modify-write automatically.
 
-  async createWriteStream(path: string): Promise<WriteStream> {
+  async createWriteStream(path: string): Promise<BlobWriteStream> {
     const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, PutObjectCommand } = this.commands;
     if (!CreateMultipartUploadCommand || !UploadPartCommand || !CompleteMultipartUploadCommand || !AbortMultipartUploadCommand) {
       throw new Error(

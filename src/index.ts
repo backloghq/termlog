@@ -11,7 +11,7 @@ export type { Tokenizer } from "./tokenizer.js";
 export { UnicodeTokenizer, DEFAULT_TOKENIZER } from "./tokenizer.js";
 
 // Storage
-export type { StorageBackend } from "./storage.js";
+export type { StorageBackend, BlobWriteStream } from "./storage.js";
 export { FsBackend } from "./storage.js";
 
 /**

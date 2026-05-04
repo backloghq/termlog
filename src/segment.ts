@@ -33,7 +33,7 @@
 import { encodePostings, decodePostings, postingIterator } from "./codec.js";
 import { TermDict } from "./term-dict.js";
 import { crc32, Crc32Stream } from "./crc32.js";
-import type { StorageBackend, WriteStream } from "./storage.js";
+import type { StorageBackend, BlobWriteStream } from "./storage.js";
 import type { Posting } from "./codec.js";
 import type { DictEntry } from "./term-dict.js";
 
@@ -66,7 +66,7 @@ export class SegmentCorruptionError extends Error {
  *   await writer.finish();
  */
 export class SegmentWriter {
-  private readonly stream: WriteStream;
+  private readonly stream: BlobWriteStream;
   /** Running CRC32 over the postings region — updated as each term is streamed. */
   private readonly postingsCrc = new Crc32Stream();
   /** Dictionary entries accumulated during writeTerm calls. */
@@ -84,7 +84,7 @@ export class SegmentWriter {
   private tombstonesArr: number[] = [];
   private lastTerm: string | undefined = undefined;
 
-  constructor(stream: WriteStream) {
+  constructor(stream: BlobWriteStream) {
     this.stream = stream;
   }
 
