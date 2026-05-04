@@ -183,7 +183,7 @@ describe("SegmentReader — corruption detection", () => {
     await w.flush("seg-001", backend);
     const data = await backend.readBlob("seg-001.seg");
     // Corrupt byte 0 (start of postings region, if non-empty)
-    if (data.length > 52) {
+    if (data.length > 64) {
       data[0] ^= 0xff;
       const { writeFile } = await import("node:fs/promises");
       const { join: pathJoin } = await import("node:path");
@@ -196,8 +196,8 @@ describe("SegmentReader — corruption detection", () => {
   it("throws SegmentCorruptionError with region='footer' for bad magic", async () => {
     await buildWriter().flush("seg-001", backend);
     const data = await backend.readBlob("seg-001.seg");
-    // Footer starts at data.length - 52; corrupt the magic (first 4 bytes of footer)
-    data[data.length - 52] ^= 0xff;
+    // Footer starts at data.length - 64; corrupt the magic (first 4 bytes of footer)
+    data[data.length - 64] ^= 0xff;
     const { writeFile } = await import("node:fs/promises");
     const { join: pathJoin } = await import("node:path");
     await writeFile(pathJoin(dir, "seg-001.seg"), data);
@@ -209,9 +209,9 @@ describe("SegmentReader — corruption detection", () => {
   it("throws SegmentCorruptionError with region='dict' when dict region is corrupted", async () => {
     await buildWriter().flush("seg-001", backend);
     const data = await backend.readBlob("seg-001.seg");
-    // Footer: dictOffset at bytes footer+24..+28 (offset from footerStart)
-    const footerStart = data.length - 52;
-    const dictOffset = data.readUInt32LE(footerStart + 24);
+    // Footer: dictOffset at bytes footer+32..+36 (offset from footerStart)
+    const footerStart = data.length - 64;
+    const dictOffset = data.readUInt32LE(footerStart + 32);
     // Corrupt one byte inside the dict region
     data[dictOffset] ^= 0xff;
     const { writeFile } = await import("node:fs/promises");

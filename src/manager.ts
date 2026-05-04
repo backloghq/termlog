@@ -90,6 +90,8 @@ export class SegmentManager {
   private buffer: BufferedDoc[] = [];
   private totalDocs = 0;
   private totalLen = 0;
+  /** Tombstone docIds accumulated since last flush — written into the next segment. */
+  private pendingTombstones = new Set<number>();
 
   /** Serialize all state-mutating operations through a promise chain. Reads are lock-free. */
   private _lock: Promise<void> = Promise.resolve();
@@ -215,15 +217,32 @@ export class SegmentManager {
   }
 
   /**
+   * Mark a document as removed. If it's still in the write buffer, drops it immediately.
+   * Otherwise, queues a tombstone that will be written into the next segment on flush.
+   * Idempotent — removing a doc not in the index is a no-op.
+   */
+  async remove(docId: number): Promise<void> {
+    return this.serialize(() => {
+      // Drop from write buffer if not yet flushed.
+      const before = this.buffer.length;
+      this.buffer = this.buffer.filter((d) => d.docId !== docId);
+      if (this.buffer.length < before) return Promise.resolve();
+      // Otherwise record a tombstone for flushed segments.
+      this.pendingTombstones.add(docId);
+      return Promise.resolve();
+    });
+  }
+
+  /**
    * Flush the current write buffer to a new immutable segment, then atomically
-   * update the manifest. No-op if the buffer is empty.
+   * update the manifest. No-op if the buffer is empty AND there are no pending tombstones.
    */
   async flush(): Promise<void> {
     return this.serialize(() => this.flushLocked());
   }
 
   private async flushLocked(): Promise<void> {
-    if (this.buffer.length === 0) return;
+    if (this.buffer.length === 0 && this.pendingTombstones.size === 0) return;
 
     const segId = `seg-${String(this.nextSegCounter).padStart(6, "0")}`;
     this.nextSegCounter++;
@@ -237,6 +256,11 @@ export class SegmentManager {
       }
       writer.setDocLength(doc.docId, doc.totalLen);
       segTotalLen += doc.totalLen;
+    }
+
+    if (this.pendingTombstones.size > 0) {
+      writer.setTombstones([...this.pendingTombstones]);
+      this.pendingTombstones = new Set();
     }
 
     await writer.flush(segId, this.backend);
@@ -300,8 +324,15 @@ export class SegmentManager {
     // IDs of the segments being merged — captured at snapshot time.
     const toMergeIds = new Set(this.manifestSegments.slice(0, toMergeCount).map((e) => e.id));
 
+    // Build the union tombstone set across all merged segments.
+    const tombstoneUnion = new Set<number>();
+    for (const seg of toMerge) {
+      for (const id of seg.tombstones) tombstoneUnion.add(id);
+    }
+
     // --- Step 1: collect all terms + postings across snapshot segments ---
     // termPostings: term → Map<oldDocId, tf>  (tf accumulates across segments for same doc)
+    // Tombstoned docIds are skipped — compaction physically removes them.
     const termPostings = new Map<string, Map<number, number>>();
 
     for (const seg of toMerge) {
@@ -310,12 +341,14 @@ export class SegmentManager {
         let postMap = termPostings.get(entry.term);
         if (!postMap) { postMap = new Map(); termPostings.set(entry.term, postMap); }
         for (let i = 0; i < docIds.length; i++) {
-          postMap.set(docIds[i], (postMap.get(docIds[i]) ?? 0) + tfs[i]);
+          if (!tombstoneUnion.has(docIds[i])) {
+            postMap.set(docIds[i], (postMap.get(docIds[i]) ?? 0) + tfs[i]);
+          }
         }
       }
     }
 
-    // Gather all unique old doc IDs and sort them.
+    // Gather all unique old doc IDs (after tombstone filtering) and sort them.
     const allOldDocIds = new Set<number>();
     for (const postMap of termPostings.values()) {
       for (const docId of postMap.keys()) allOldDocIds.add(docId);

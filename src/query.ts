@@ -12,6 +12,7 @@
  *                            present in ANY term iterator, accumulating tf per term.
  *
  * All iterators are lazy — no postings are decoded until next()/seek() is called.
+ * Tombstoned doc IDs are filtered at the MultiSegmentIter level.
  */
 
 import type { SegmentReader } from "./segment.js";
@@ -79,6 +80,19 @@ export class SegmentPostingIter {
 }
 
 // ---------------------------------------------------------------------------
+// Tombstone union — built once per query from all segment tombstone arrays
+// ---------------------------------------------------------------------------
+
+/** Build the union of all tombstone sets across segments for O(1) lookup. */
+export function buildTombstoneSet(segments: SegmentReader[]): Set<number> {
+  const set = new Set<number>();
+  for (const seg of segments) {
+    for (const id of seg.tombstones) set.add(id);
+  }
+  return set;
+}
+
+// ---------------------------------------------------------------------------
 // Multi-segment iterator for one term (k-way merge)
 // ---------------------------------------------------------------------------
 
@@ -86,14 +100,25 @@ export class SegmentPostingIter {
  * Merges per-segment SegmentPostingIters for a single term by docId order.
  * Uses a simple linear scan over active iterators (k is small for v0.1;
  * a binary heap can be added in v0.2 for large segment counts).
+ * Tombstoned docIds (from the provided set) are skipped transparently.
  */
 export class MultiSegmentIter {
   readonly term: string;
   private readonly iters: SegmentPostingIter[];
+  private readonly tombstones: Set<number> = new Set();
 
-  constructor(term: string, segments: SegmentReader[]) {
+  constructor(term: string, segments: SegmentReader[], tombstones?: Set<number>) {
     this.term = term;
+    this.tombstones = tombstones ?? new Set();
     this.iters = segments.map((seg) => new SegmentPostingIter(seg.postings(term)));
+    // Advance past any tombstoned entries at the head of each iterator.
+    for (const it of this.iters) this.skipTombstones(it);
+  }
+
+  private skipTombstones(it: SegmentPostingIter): void {
+    while (!it.isExhausted && it.docId !== null && this.tombstones.has(it.docId)) {
+      it.advance();
+    }
   }
 
   get isExhausted(): boolean {
@@ -114,7 +139,7 @@ export class MultiSegmentIter {
   /**
    * Collect the tf for the current minimum docId (summing across segments that
    * share the same docId, though in practice each docId lives in one segment).
-   * Advances all iterators that were at that docId.
+   * Advances all iterators that were at that docId, skipping past tombstones.
    */
   next(): { docId: number; tf: number } | null {
     const docId = this.currentDocId;
@@ -124,15 +149,17 @@ export class MultiSegmentIter {
       if (!it.isExhausted && it.docId === docId) {
         tf += it.tf;
         it.advance();
+        this.skipTombstones(it);
       }
     }
     return { docId, tf };
   }
 
-  /** Advance all iterators until their current docId >= target. */
+  /** Advance all iterators until their current docId >= target, skipping tombstones. */
   seek(target: number): void {
     for (const it of this.iters) {
       it.seek(target);
+      this.skipTombstones(it);
     }
   }
 }
@@ -158,7 +185,8 @@ export function* andQuery(
 ): Generator<QueryPosting> {
   if (terms.length === 0 || segments.length === 0) return;
 
-  const iters = terms.map((t) => new MultiSegmentIter(t, segments));
+  const tombstones = buildTombstoneSet(segments);
+  const iters = terms.map((t) => new MultiSegmentIter(t, segments, tombstones));
 
   while (true) {
     // Check exhaustion.
@@ -204,7 +232,8 @@ export function* orQuery(
 ): Generator<QueryPosting> {
   if (terms.length === 0 || segments.length === 0) return;
 
-  const iters = terms.map((t) => new MultiSegmentIter(t, segments));
+  const tombstones = buildTombstoneSet(segments);
+  const iters = terms.map((t) => new MultiSegmentIter(t, segments, tombstones));
 
   while (true) {
     // Find the minimum current docId across all active iterators.

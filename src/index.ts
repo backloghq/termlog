@@ -1,5 +1,9 @@
 export const VERSION = "0.1.0";
 
+// Tokenizer
+export type { Tokenizer } from "./tokenizer.js";
+export { UnicodeTokenizer, DEFAULT_TOKENIZER } from "./tokenizer.js";
+
 // Storage
 export type { StorageBackend } from "./storage.js";
 export { FsBackend } from "./storage.js";
@@ -21,7 +25,7 @@ export { SegmentManager, ManifestCorruptionError } from "./manager.js";
 
 // Query
 export type { QueryPosting } from "./query.js";
-export { SegmentPostingIter, MultiSegmentIter, andQuery, orQuery } from "./query.js";
+export { SegmentPostingIter, MultiSegmentIter, andQuery, orQuery, buildTombstoneSet } from "./query.js";
 
 // Scoring
 export type { BM25Opts, ScoredDoc } from "./scoring.js";
