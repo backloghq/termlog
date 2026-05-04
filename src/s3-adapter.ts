@@ -181,7 +181,7 @@ export class S3StorageAdapter implements StorageBackend {
   // saveDocIds() falls back to read-modify-write automatically.
 
   async createWriteStream(path: string): Promise<WriteStream> {
-    const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand } = this.commands;
+    const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, PutObjectCommand } = this.commands;
     if (!CreateMultipartUploadCommand || !UploadPartCommand || !CompleteMultipartUploadCommand || !AbortMultipartUploadCommand) {
       throw new Error(
         "S3StorageAdapter.createWriteStream requires CreateMultipartUploadCommand, UploadPartCommand, " +
@@ -225,11 +225,34 @@ export class S3StorageAdapter implements StorageBackend {
       },
       async end(): Promise<void> {
         if (done) return;
-        done = true;
+        if (parts.length === 0 && bufferedSize === 0) {
+          // Zero-byte stream — S3 rejects CompleteMultipartUpload with empty Parts.
+          // Abort the upload and fall back to an empty PutObject.
+          done = true;
+          await client.send(
+            new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
+          ).catch(() => undefined);
+          await client.send(
+            new PutObjectCommand({ Bucket: bucket, Key: key, Body: Buffer.alloc(0), ContentType: "application/octet-stream" }),
+          );
+          return;
+        }
         await flush(true);
-        await client.send(
-          new CompleteMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId, MultipartUpload: { Parts: parts } }),
-        );
+        try {
+          await client.send(
+            new CompleteMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId, MultipartUpload: { Parts: parts } }),
+          );
+          done = true;
+        } catch (err) {
+          // Complete failed — abort the dangling upload before re-throwing.
+          try {
+            await client.send(
+              new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
+            );
+          } catch { /* best-effort */ }
+          done = true;
+          throw err;
+        }
       },
       async abort(): Promise<void> {
         if (done) return;
