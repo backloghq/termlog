@@ -162,3 +162,86 @@ describe("StorageBackend interface compatibility", () => {
       .then((buf) => expect(buf.toString()).toBe("hi"));
   });
 });
+
+// ---------------------------------------------------------------------------
+// FsBackend.createWriteStream
+// ---------------------------------------------------------------------------
+
+describe("FsBackend.createWriteStream", () => {
+  let dir: string;
+  let backend: FsBackend;
+
+  beforeEach(async () => {
+    dir = await makeTmpDir();
+    backend = new FsBackend(dir);
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("target path not visible between write() and end()", async () => {
+    const stream = await backend.createWriteStream("partial.bin");
+    await stream.write(Buffer.from("chunk1"));
+    // Target must not yet exist.
+    const { access } = await import("node:fs/promises");
+    await expect(access(join(dir, "partial.bin"))).rejects.toThrow();
+    await stream.end();
+    // After end(), it exists.
+    await expect(access(join(dir, "partial.bin"))).resolves.toBeUndefined();
+  });
+
+  it("abort() removes the .tmp and never creates the target", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const stream = await backend.createWriteStream("aborted.bin");
+    await stream.write(Buffer.from("some data"));
+    await stream.abort();
+
+    const files = await readdir(dir);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
+    const { access } = await import("node:fs/promises");
+    await expect(access(join(dir, "aborted.bin"))).rejects.toThrow();
+  });
+
+  it("double end() is a no-op (second call returns without error)", async () => {
+    const stream = await backend.createWriteStream("double-end.bin");
+    await stream.write(Buffer.from("data"));
+    await stream.end();
+    await expect(stream.end()).resolves.toBeUndefined();
+    const result = await backend.readBlob("double-end.bin");
+    expect(result.toString()).toBe("data");
+  });
+
+  it("double abort() is a no-op", async () => {
+    const stream = await backend.createWriteStream("double-abort.bin");
+    await stream.write(Buffer.from("data"));
+    await stream.abort();
+    await expect(stream.abort()).resolves.toBeUndefined();
+  });
+
+  it("write() error propagates and abort() cleans up .tmp", async () => {
+    const { open } = await import("node:fs/promises");
+
+    // Patch the internal fh.write to simulate ENOSPC.
+    const stream = await backend.createWriteStream("enospc.bin");
+    // Replace the stream's write with one that throws ENOSPC.
+    const enospc = Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+    const orig = stream.write.bind(stream);
+    let callCount = 0;
+    stream.write = async (chunk: Buffer) => {
+      callCount++;
+      if (callCount === 1) throw enospc;
+      return orig(chunk);
+    };
+
+    const writeErr = await stream.write(Buffer.from("data")).catch((e) => e) as NodeJS.ErrnoException;
+    expect(writeErr.code).toBe("ENOSPC");
+
+    // Explicit abort cleans up.
+    await stream.abort();
+    const { readdir } = await import("node:fs/promises");
+    const files = await readdir(dir);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
+    void open; // suppress unused-import lint
+  });
+});
