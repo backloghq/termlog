@@ -91,6 +91,15 @@ export class SegmentManager {
   private totalDocs = 0;
   private totalLen = 0;
 
+  /** Serialize all state-mutating operations through a promise chain. Reads are lock-free. */
+  private _lock: Promise<void> = Promise.resolve();
+  private serialize<R>(fn: () => Promise<R>): Promise<R> {
+    const prev = this._lock;
+    let resolve!: () => void;
+    this._lock = new Promise<void>((r) => { resolve = r; });
+    return prev.then(fn).finally(() => resolve());
+  }
+
   private constructor(
     backend: StorageBackend,
     flushThreshold: number,
@@ -193,14 +202,16 @@ export class SegmentManager {
     docId: number,
     terms: Array<{ term: string; tf: number }>,
   ): Promise<void> {
-    const totalLen = terms.reduce((s, t) => s + t.tf, 0);
-    this.buffer.push({ docId, terms, totalLen });
-    if (this.buffer.length >= this.flushThreshold) {
-      await this.flush();
-      if (this.manifestSegments.length >= this.mergeThreshold) {
-        await this.compact();
+    return this.serialize(async () => {
+      const totalLen = terms.reduce((s, t) => s + t.tf, 0);
+      this.buffer.push({ docId, terms, totalLen });
+      if (this.buffer.length >= this.flushThreshold) {
+        await this.flushLocked();
+        if (this.manifestSegments.length >= this.mergeThreshold) {
+          await this.compactLocked();
+        }
       }
-    }
+    });
   }
 
   /**
@@ -208,6 +219,10 @@ export class SegmentManager {
    * update the manifest. No-op if the buffer is empty.
    */
   async flush(): Promise<void> {
+    return this.serialize(() => this.flushLocked());
+  }
+
+  private async flushLocked(): Promise<void> {
     if (this.buffer.length === 0) return;
 
     const segId = `seg-${String(this.nextSegCounter).padStart(6, "0")}`;
@@ -273,6 +288,10 @@ export class SegmentManager {
    *      the source of truth and old readers hold their own Buffer references).
    */
   async compact(): Promise<void> {
+    return this.serialize(() => this.compactLocked());
+  }
+
+  private async compactLocked(): Promise<void> {
     // Snapshot readers and their corresponding manifest IDs atomically.
     const toMerge = this.readerSnapshot;
     const toMergeCount = toMerge.length;
