@@ -236,6 +236,12 @@ export class SegmentManager {
       throw new ManifestCorruptionError(String(err));
     }
 
+    if (manifest.version !== MANIFEST_VERSION) {
+      throw new ManifestCorruptionError(
+        `unsupported manifest version ${manifest.version} (expected ${MANIFEST_VERSION})`,
+      );
+    }
+
     this._manifestLoaded = true;
     this._persistedTokenizerKind = manifest.tokenizer.kind;
     this._persistedTokenizerMinLen = manifest.tokenizer.minLen;

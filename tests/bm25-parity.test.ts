@@ -125,12 +125,19 @@ function buildReference(k1: number, b: number) {
     }
   }
 
-  function searchScored(query: string, limit: number): Array<{ id: number; score: number }> {
+  function searchScored(
+    query: string,
+    limit: number,
+    mode: "or" | "and" = "or",
+  ): Array<{ id: number; score: number }> {
     const terms = tokenize(query);
     if (terms.length === 0) return [];
 
     const scores = new Map<number, number>();
     for (const doc of docs) {
+      // AND: skip doc if any query term is missing.
+      if (mode === "and" && terms.some((t) => !doc.tfMap.has(t))) continue;
+
       let docScore = 0;
       for (const term of new Set(terms)) {
         const tf = doc.tfMap.get(term) ?? 0;
@@ -377,5 +384,41 @@ describe("BM25Ranker — parity vs reference (k1=1.2, b=1)", () => {
       expect(termlogResults[i].docId).toBe(refResults[i].id);
       expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AND mode parity (#d56aa368)
+// ---------------------------------------------------------------------------
+
+describe("BM25Ranker — AND mode parity vs reference (k1=1.2, b=0.75)", () => {
+  const ref = buildReference(1.2, 0.75);
+  const ranker = new BM25Ranker({ k1: 1.2, b: 0.75 });
+
+  it('query: "fox dog" (intersection)', () => {
+    const refResults = ref.searchScored("fox dog", 10, "and");
+    const termlogResults = ranker.score(tokenize("fox dog"), [seg], N, totalLen, 10, "and");
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
+    }
+  });
+
+  it('query: "quick brown fox" (three-term intersection)', () => {
+    const refResults = ref.searchScored("quick brown fox", 10, "and");
+    const termlogResults = ranker.score(tokenize("quick brown fox"), [seg], N, totalLen, 10, "and");
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
+    }
+  });
+
+  it('query: "fox xyzzynonexistent" (empty intersection)', () => {
+    const refResults = ref.searchScored("fox xyzzynonexistent", 10, "and");
+    const termlogResults = ranker.score(tokenize("fox xyzzynonexistent"), [seg], N, totalLen, 10, "and");
+    expect(termlogResults).toEqual([]);
+    expect(refResults).toEqual([]);
   });
 });

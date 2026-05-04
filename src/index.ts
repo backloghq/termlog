@@ -12,6 +12,8 @@ export { UnicodeTokenizer, DEFAULT_TOKENIZER } from "./tokenizer.js";
 export type { StorageBackend } from "./storage.js";
 export { FsBackend } from "./storage.js";
 
+// @internal — low-level building blocks; not covered by semver stability guarantees.
+
 // Codec
 export type { Posting } from "./codec.js";
 export { encodePostings, decodePostings, postingIterator, encodeVByte, decodeVByte } from "./codec.js";

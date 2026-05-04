@@ -13,7 +13,9 @@ import { crc32 } from "../src/crc32.js";
 import { encodeVByte, decodeVByte } from "../src/codec.js";
 import { FsBackend } from "../src/storage.js";
 import { SegmentWriter, SegmentReader } from "../src/segment.js";
+import { TermDict } from "../src/term-dict.js";
 import { TermLog } from "../src/termlog.js";
+import { SegmentManager } from "../src/manager.js";
 import { UnicodeTokenizer } from "../src/tokenizer.js";
 import type { Tokenizer } from "../src/tokenizer.js";
 
@@ -94,6 +96,25 @@ describe("segment version mismatch", () => {
     data.writeUInt32LE(99, footerStart + 4); // bad version
     await writeFile(join(dir, "seg-v.seg"), data);
     await expect(SegmentReader.open("seg-v.seg", backend))
+      .rejects.toMatchObject({ name: "SegmentCorruptionError", region: "footer" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Footer too small (graceful SegmentCorruptionError, not buffer crash)
+// ---------------------------------------------------------------------------
+
+describe("footer too small", () => {
+  it("throws SegmentCorruptionError with region=footer for a truncated file", async () => {
+    // Write a valid segment, then truncate it below FOOTER_SIZE bytes.
+    const w = new SegmentWriter();
+    w.addPosting("x", 0, 1);
+    w.setDocLength(0, 1);
+    await w.flush("seg-trunc", backend);
+    const data = await backend.readBlob("seg-trunc.seg");
+    // Truncate to 10 bytes — definitely < 64-byte footer.
+    await writeFile(join(dir, "seg-trunc.seg"), data.subarray(0, 10));
+    await expect(SegmentReader.open("seg-trunc.seg", backend))
       .rejects.toMatchObject({ name: "SegmentCorruptionError", region: "footer" });
   });
 });
@@ -263,5 +284,89 @@ describe("tokenizer kind persistence", () => {
     await expect(
       TermLog.open({ dir, backend, tokenizer: tok3, flushThreshold: 100 }),
     ).rejects.toMatchObject({ name: "TokenizerMismatchError" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Term length validation (#b013b551)
+// ---------------------------------------------------------------------------
+
+describe("term length validation", () => {
+  it("serialize() throws RangeError for a term exceeding 65535 UTF-8 bytes", () => {
+    const dict = new TermDict();
+    dict.add({ term: "a".repeat(65536), postingsOffset: 0, postingsLength: 1, df: 1 });
+    expect(() => dict.serialize()).toThrow(RangeError);
+  });
+
+  it("serialize() accepts a term of exactly 65535 bytes without throwing", () => {
+    const dict = new TermDict();
+    dict.add({ term: "a".repeat(65535), postingsOffset: 0, postingsLength: 1, df: 1 });
+    expect(() => dict.serialize()).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manifest version validation (#1ca41d22)
+// ---------------------------------------------------------------------------
+
+describe("manifest version validation", () => {
+  it("throws ManifestCorruptionError when reopening a manifest with an unsupported version", async () => {
+    // Build a valid index, then corrupt the manifest version field.
+    const mgr = await SegmentManager.open({ backend, dir });
+    await mgr.add(0, [{ term: "a", tf: 1 }]);
+    await mgr.flush();
+    await mgr.close();
+
+    // Overwrite manifest.json with version=99.
+    const raw = await backend.readBlob("manifest.json");
+    const manifest = JSON.parse(raw.toString("utf8")) as Record<string, unknown>;
+    manifest["version"] = 99;
+    await backend.writeBlob("manifest.json", Buffer.from(JSON.stringify(manifest), "utf8"));
+
+    await expect(SegmentManager.open({ backend, dir }))
+      .rejects.toMatchObject({ name: "ManifestCorruptionError" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// docids.json / manifest atomicity invariant (#30b13d68)
+// ---------------------------------------------------------------------------
+
+describe("docids.json / manifest atomicity invariant", () => {
+  it("docids.json is never behind the manifest after a flush", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    await tl.add("doc-a", "hello");
+    await tl.add("doc-b", "world");
+    await tl.flush();
+    await tl.close();
+
+    // Reopened index must resolve both docIds via the persisted mapping.
+    const tl2 = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    const results = await tl2.search("hello");
+    expect(results.map((r) => r.docId)).toContain("doc-a");
+    await tl2.close();
+  });
+
+  it("crash-simulation: docids.json written before manifest; reopen recovers correctly", async () => {
+    // Simulate the scenario: docids.json exists but manifest has not yet committed.
+    // We do this by creating docids.json manually with an extra entry that the
+    // manifest doesn't reference — the extra entry should be harmless phantom.
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    await tl.add("real-doc", "hello");
+    await tl.flush();
+    await tl.close();
+
+    // Inject a phantom mapping entry into docids.json (simulates pre-manifest write).
+    const raw = await backend.readBlob("docids.json");
+    const mapping = JSON.parse(raw.toString("utf8")) as { nextNumId: number; entries: [string, number][] };
+    mapping.entries.push(["phantom-doc", mapping.nextNumId]);
+    mapping.nextNumId++;
+    await backend.writeBlob("docids.json", Buffer.from(JSON.stringify(mapping), "utf8"));
+
+    // Reopening must succeed; phantom entry is harmless (no segment data for it).
+    const tl2 = await TermLog.open({ dir, backend, flushThreshold: 1000 });
+    const results = await tl2.search("hello");
+    expect(results.map((r) => r.docId)).toContain("real-doc");
+    await tl2.close();
   });
 });

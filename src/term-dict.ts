@@ -63,7 +63,13 @@ export class TermDict {
   serialize(): Buffer {
     // Compute total size first
     const encoder = new TextEncoder();
-    const termBytes = this.entries.map((e) => encoder.encode(e.term));
+    const termBytes = this.entries.map((e) => {
+      const tb = encoder.encode(e.term);
+      if (tb.length > 0xffff) {
+        throw new RangeError(`term too long: ${tb.length} bytes (max 65535)`);
+      }
+      return tb;
+    });
     // 4 (count) + sum of (2 + termLen + 4 + 4 + 4) per entry
     let totalSize = 4;
     for (const tb of termBytes) totalSize += 2 + tb.length + 12;
