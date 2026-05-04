@@ -12,6 +12,7 @@
 
 import type { SegmentReader } from "./segment.js";
 import { andQuery, orQuery } from "./query.js";
+import { MinHeap } from "./heap.js";
 
 export interface BM25Opts {
   k1?: number;
@@ -109,43 +110,77 @@ export class BM25Ranker {
       dfMap.set(term, df);
     }
 
-    // Iterate candidates with the requested boolean mode; accumulate per-doc scores.
-    const scores = new Map<number, number>();
+    // Score each candidate. orQuery/andQuery emit each docId exactly once.
     const queryIter = mode === "and" ? andQuery(terms, segments) : orQuery(terms, segments);
 
+    if (limit !== undefined && limit > 0) {
+      // Path B: top-k min-heap — O(hits * log(limit)) instead of O(hits * log(hits)).
+      // The heap root is the worst element (lowest score; lex-largest docId on tie)
+      // so we can evict it when a better candidate arrives.
+      const heap = new MinHeap<ScoredDoc>((a, z) => {
+        if (a.score !== z.score) return a.score - z.score;
+        // Same score: lex-larger docId is worse → put it at root (return negative).
+        const sa = String(a.docId); const sz = String(z.docId);
+        return sa > sz ? -1 : sa < sz ? 1 : 0;
+      });
+
+      for (const { docId, tfs, segIndex } of queryIter) {
+        let docScore = 0;
+        const dl = segments[segIndex]?.docLen(docId) ?? 0;
+        for (const [term, tf] of tfs) {
+          if (!tf) continue;
+          const df = dfMap.get(term) ?? 0;
+          if (df === 0) continue;
+          docScore += bm25Score(tf, dl, df, N, k1, b, avgdl);
+        }
+        if (docScore <= 0) continue;
+
+        if (heap.size < limit) {
+          heap.push({ docId, score: docScore });
+        } else {
+          const worst = heap.peek()!;
+          // New entry is better than worst if: higher score, or same score + lex-smaller docId.
+          const sa = String(docId); const sw = String(worst.docId);
+          const betterThanWorst =
+            docScore > worst.score ||
+            (docScore === worst.score && sa < sw);
+          if (betterThanWorst) {
+            heap.pop();
+            heap.push({ docId, score: docScore });
+          }
+        }
+      }
+
+      if (heap.size === 0) return [];
+      // Drain heap: arrives in worst-first order; reverse for score-desc, lex-asc.
+      const results: ScoredDoc[] = [];
+      while (heap.size > 0) results.push(heap.pop()!);
+      results.reverse();
+      return results;
+    }
+
+    // No limit: collect all hits, then sort. O(hits log hits).
+    const results: ScoredDoc[] = [];
     for (const { docId, tfs, segIndex } of queryIter) {
       let docScore = 0;
       const dl = segments[segIndex]?.docLen(docId) ?? 0;
-
       for (const [term, tf] of tfs) {
-        if (!tf) continue; // skip tf=0 placeholders (mirrors agentdb)
+        if (!tf) continue;
         const df = dfMap.get(term) ?? 0;
         if (df === 0) continue;
         docScore += bm25Score(tf, dl, df, N, k1, b, avgdl);
       }
-
-      if (docScore > 0) {
-        scores.set(docId, (scores.get(docId) ?? 0) + docScore);
-      }
+      if (docScore > 0) results.push({ docId, score: docScore });
     }
 
-    if (scores.size === 0) return [];
+    if (results.length === 0) return [];
 
-    let results: ScoredDoc[] = Array.from(scores.entries()).map(([docId, score]) => ({
-      docId,
-      score,
-    }));
-
-    // Sort: score desc, then tie-break by string-lexicographic docId asc.
-    // agentdb stores IDs as strings; its tie-break is `a.id < b.id` (lex), so
-    // "11" < "2" — not numeric. Mirror that here for parity.
+    // Sort: score desc, tie-break lex-asc on stringified docId (mirrors agentdb).
     results.sort((a, z) => {
       if (z.score !== a.score) return z.score - a.score;
       const sa = String(a.docId); const sz = String(z.docId);
       return sa < sz ? -1 : sa > sz ? 1 : 0;
     });
-
-    if (limit !== undefined) results = results.slice(0, limit);
     return results;
   }
 }
