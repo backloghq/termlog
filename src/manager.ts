@@ -116,11 +116,11 @@ export class SegmentManager {
   }
 
   private async loadManifest(): Promise<void> {
-    // Scenario 3: stale manifest.tmp from interrupted rename — delete it.
-    // manifest.json (if present) is always complete because FsBackend.writeBlob
-    // is itself atomic (writes to .tmp then renames), so manifest.json is either
-    // absent or fully written.
+    // Scenario 3: stale *.tmp from interrupted FsBackend rename — delete any
+    // manifest-related temp files. manifest.json is either absent or fully
+    // written (FsBackend.writeBlob is atomic: writes to <path>.tmp then renames).
     try { await this.backend.deleteBlob(MANIFEST_TMP); } catch { /* not present */ }
+    try { await this.backend.deleteBlob(`${MANIFEST_FILE}.tmp`); } catch { /* not present */ }
 
     let raw: Buffer;
     try {
@@ -169,8 +169,8 @@ export class SegmentManager {
     }
 
     for (const blob of allBlobs) {
-      // Delete any *.seg.tmp (abandoned write).
-      if (blob.endsWith(".seg.tmp")) {
+      // Delete any *.tmp (abandoned FsBackend atomic write or old manifest.tmp).
+      if (blob.endsWith(".tmp")) {
         try { await this.backend.deleteBlob(blob); } catch { /* best-effort */ }
         continue;
       }
@@ -368,12 +368,10 @@ export class SegmentManager {
     }
   }
 
-  /** Write manifest atomically via tmp-then-rename. */
+  /** Write manifest atomically. FsBackend.writeBlob is itself atomic (tmp+rename). */
   private async writeManifest(manifest: Manifest): Promise<void> {
     const data = Buffer.from(JSON.stringify(manifest), "utf8");
-    await this.backend.writeBlob(MANIFEST_TMP, data);
     await this.backend.writeBlob(MANIFEST_FILE, data);
-    await this.backend.deleteBlob(MANIFEST_TMP);
   }
 
   /**

@@ -39,10 +39,12 @@ export class FsBackend implements StorageBackend {
     return readFile(this.abs(path));
   }
 
-  /** Atomic write: write to <path>.tmp, then rename over <path>. */
+  /** Atomic write: write to a unique <path>.<nonce>.tmp, then rename over <path>. */
   async writeBlob(path: string, data: Buffer): Promise<void> {
     const dest = this.abs(path);
-    const tmp = dest + ".tmp";
+    // Unique per-call nonce so concurrent writeBlob("same-path") calls don't
+    // stomp each other's temp file.
+    const tmp = `${dest}.${process.hrtime.bigint()}.tmp`;
     await mkdir(dirname(dest), { recursive: true });
     await writeFile(tmp, data);
     await rename(tmp, dest);
