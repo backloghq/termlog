@@ -81,7 +81,7 @@ export class TermLog {
       dir: opts.dir,
       flushThreshold: opts.flushThreshold,
       mergeThreshold: opts.mergeThreshold,
-      tokenizer: { kind: tokenizer.kind, minLen: 1 },
+      tokenizer: { kind: tokenizer.kind, minLen: tokenizer.minLen ?? 1 },
       onBeforeManifest: () => box.tl!.saveDocIds(),
     });
 
@@ -174,10 +174,7 @@ export class TermLog {
 
     const mode = opts?.mode ?? "or";
     const limit = opts?.limit;
-    const scored = ranker.score(terms, segments, this.mgr.indexTotalDocs, this.mgr.indexTotalLen, limit);
-
-    // mode "and" is not yet wired through BM25Ranker — or is the default.
-    void mode;
+    const scored = ranker.score(terms, segments, this.mgr.indexTotalDocs, this.mgr.indexTotalLen, limit, mode);
 
     return scored.flatMap((r) => {
       const str = this.numToStr.get(r.docId);

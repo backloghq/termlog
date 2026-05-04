@@ -11,7 +11,7 @@
  */
 
 import type { SegmentReader } from "./segment.js";
-import { orQuery } from "./query.js";
+import { andQuery, orQuery } from "./query.js";
 
 export interface BM25Opts {
   k1?: number;
@@ -87,6 +87,7 @@ export class BM25Ranker {
     N: number,
     totalLen: number,
     limit?: number,
+    mode: "and" | "or" = "or",
   ): ScoredDoc[] {
     if (terms.length === 0 || N === 0) return [];
 
@@ -104,10 +105,11 @@ export class BM25Ranker {
       dfMap.set(term, df);
     }
 
-    // OR-iterate all candidates; accumulate per-doc scores.
+    // Iterate candidates with the requested boolean mode; accumulate per-doc scores.
     const scores = new Map<number, number>();
+    const queryIter = mode === "and" ? andQuery(terms, segments) : orQuery(terms, segments);
 
-    for (const { docId, tfs } of orQuery(terms, segments)) {
+    for (const { docId, tfs } of queryIter) {
       let docScore = 0;
       // Look up dl: docLen lives in the segment that contains this docId.
       let dl = 0;

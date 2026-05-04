@@ -6,6 +6,8 @@
 export interface Tokenizer {
   /** Stable identifier persisted in the manifest. */
   readonly kind: string;
+  /** Minimum token length, persisted in the manifest. Defaults to 1 if not provided. */
+  readonly minLen?: number;
   tokenize(text: string): string[];
 }
 
@@ -16,7 +18,7 @@ export interface Tokenizer {
  */
 export class UnicodeTokenizer implements Tokenizer {
   readonly kind = "unicode" as const;
-  private readonly minLen: number;
+  readonly minLen: number;
 
   constructor(minLen = 1) {
     this.minLen = minLen;

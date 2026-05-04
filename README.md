@@ -2,7 +2,7 @@
 
 Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.
 
-**Status:** v0.1.0 — 204 tests. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM compaction, crash recovery, advisory lockfile, reader snapshot isolation.
+**Status:** v0.1.0 — 207 tests. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM compaction, crash recovery, advisory lockfile, reader snapshot isolation.
 
 ## Why
 
