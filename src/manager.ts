@@ -649,10 +649,10 @@ export class SegmentManager {
 
     // Keep segments not in the merge set, preserving their original order.
     const survivingEntries = this.manifestSegments.filter((e) => !toMergeIds.has(e.id));
-    const newSegmentList = [mergedEntry, ...survivingEntries];
+    const newManifestSegments = [mergedEntry, ...survivingEntries];
 
-    const newTotalDocs = newSegmentList.reduce((s, e) => s + e.docCount, 0);
-    const newTotalLen = newSegmentList.reduce((s, e) => s + e.totalLen, 0);
+    const newTotalDocs = newManifestSegments.reduce((s, e) => s + e.docCount, 0);
+    const newTotalLen = newManifestSegments.reduce((s, e) => s + e.totalLen, 0);
 
     // Build new state into locals, then commit atomically: writeManifest first,
     // then update all in-memory fields together. If writeManifest throws, nothing
@@ -663,7 +663,7 @@ export class SegmentManager {
     await this.writeManifest({
       version: MANIFEST_VERSION,
       generation: newGeneration,
-      segments: newSegmentList,
+      segments: newManifestSegments,
       tokenizer: this.tokenizerConfig,
       totalDocs: newTotalDocs,
       totalLen: newTotalLen,
@@ -673,7 +673,7 @@ export class SegmentManager {
     this.generation = newGeneration;
     this.totalDocs = newTotalDocs;
     this.totalLen = newTotalLen;
-    this.manifestSegments = newSegmentList;
+    this.manifestSegments = newManifestSegments;
     this.readerSnapshot = [mergedReader, ...newSurvivingReaders];
 
     // --- Step 4: delete old segment files (post-manifest-commit) ---
