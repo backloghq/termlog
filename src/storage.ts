@@ -151,12 +151,19 @@ export class FsBackend implements StorageBackend {
       },
       async end(): Promise<void> {
         if (done) return;
-        done = true;
-        await fh.sync();
-        await fh.close();
-        await rename(tmp, dest);
-        const dh = await open(dir, "r");
-        try { await dh.sync(); } finally { await dh.close(); }
+        try {
+          await fh.sync();
+          await fh.close();
+          await rename(tmp, dest);
+          const dh = await open(dir, "r");
+          try { await dh.sync(); } finally { await dh.close(); }
+          done = true;
+        } catch (err) {
+          try { await fh.close(); } catch { /* may already be closed */ }
+          try { await unlink(tmp); } catch { /* may not exist */ }
+          done = true;
+          throw err;
+        }
       },
       async abort(): Promise<void> {
         if (done) return;

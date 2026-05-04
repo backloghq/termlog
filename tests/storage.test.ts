@@ -244,4 +244,41 @@ describe("FsBackend.createWriteStream", () => {
     expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
     void open; // suppress unused-import lint
   });
+
+  it("end() failure: error propagates, .tmp is cleaned up, abort() becomes a no-op", async () => {
+    const { readdir, mkdir: fsMkdir } = await import("node:fs/promises");
+
+    // Use a subdirectory so we can remove it after write() to make rename() fail.
+    const subdir = join(dir, "sub");
+    await fsMkdir(subdir);
+    const subBackend = new FsBackend(subdir);
+
+    const stream = await subBackend.createWriteStream("fail.bin");
+    await stream.write(Buffer.from("data"));
+
+    // Remove the subdirectory while the .tmp file is open inside it.
+    // rename() will fail with ENOENT (destination directory gone).
+    await rm(subdir, { recursive: true, force: true });
+
+    const endErr = await stream.end().catch((e) => e) as NodeJS.ErrnoException;
+    // The real end() must have thrown.
+    expect(endErr).toBeInstanceOf(Error);
+
+    // done=true is set in the catch block, so abort() must be a no-op.
+    await expect(stream.abort()).resolves.toBeUndefined();
+
+    // No .tmp survives in the original dir (subdir is gone — cleanup is best-effort).
+    const files = await readdir(dir);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
+  });
+
+  it("end() success: no .tmp survives and target is visible", async () => {
+    const { readdir, access } = await import("node:fs/promises");
+    const stream = await backend.createWriteStream("end-ok.bin");
+    await stream.write(Buffer.from("ok"));
+    await stream.end();
+    const files = await readdir(dir);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
+    await expect(access(join(dir, "end-ok.bin"))).resolves.toBeUndefined();
+  });
 });
