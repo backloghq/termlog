@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **TermLog facade (`src/termlog.ts`)** — `TermLog.open/add/remove/search/flush/compact/close` with string docId mapping (persisted in `docids.json`), automatic tokenization, BM25 search. `MappingCorruptionError` on corrupt docids.json. 8 tests.
+- **Tokenizer abstraction (`src/tokenizer.ts`)** — `Tokenizer` interface with `kind: string` field; `UnicodeTokenizer` matching agentdb's `/[\p{L}\p{M}\p{N}]+/gu` regex; `DEFAULT_TOKENIZER`. Tokenizer kind persisted in manifest; `TokenizerMismatchError` thrown on reopen with different kind.
+- **remove(docId) + tombstone region** — Segment v2 format (64-byte footer); tombstones region (`uint32 count | uint32[] sorted docIds`, CRC32 verified). `SegmentManager.remove()` drops from buffer or queues tombstone. Compaction physically skips tombstoned docIds. `MultiSegmentIter` filters tombstoned docIds from query results. 6 tests.
+- **Write mutex on SegmentManager** — `serialize<R>()` promise-chain pattern (mirrors opslog) serializes `add/flush/compact/remove`; reads remain lock-free.
+- **Advisory lockfile** — `SegmentManager.open({ dir })` acquires `.lock` via `O_EXCL` open; `IndexLockedError` on live-process conflict; stale-pid auto-claim. `close()` releases lock. 4 tests.
+- **Streaming k-way merge in `compact()`** — `src/heap.ts` binary min-heap; compaction streams term-by-term from heap (O(K) + O(largest posting list) memory) instead of materializing `Map<term, Map<docId, tf>>`.
+- **Full public surface exported from `src/index.ts`** — all classes, functions, and types.
+- **Test gaps batch** (`tests/gaps.test.ts`) — CRC32 known-vectors, decodeVByte edge cases (0/2^21/2^35), segment version mismatch, sidecar CRC corruption, concurrent writeBlob race (nonce isolation), UnicodeTokenizer parity, tokenizer kind round-trip, `TokenizerMismatchError`. 19 tests.
+
+### Fixed
+- `SegmentWriter.flush()` was double-writing the segment file (redundant write + delete of tmp); now writes directly once via `FsBackend.writeBlob`.
+- `loadManifest` caught all errors and silently treated them as fresh-index; now re-throws non-ENOENT errors (EACCES, EIO, S3 5xx).
+- `recoverOrphans` used `listBlobs("")` (full-bucket scan on S3); now uses `listBlobs("seg-")` + `listBlobs("manifest")`.
+- `TermLog.close()` now delegates to `SegmentManager.close()` which releases the advisory lock.
+
 ## [0.1.0] - 2026-05-04
 
 ### Added
