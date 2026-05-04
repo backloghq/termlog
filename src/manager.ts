@@ -411,7 +411,7 @@ export class SegmentManager {
     // First pass: collect surviving docIds from all posting lists (skip tombstoned).
     const survivingOldDocIds = new Set<number>();
     for (const seg of toMerge) {
-      for (const entry of seg.terms() as Generator<DictEntry>) {
+      for (const entry of seg.terms()) {
         const { docIds } = seg.decodePostings(entry.term);
         for (const id of docIds) {
           if (!tombstoneUnion.has(id)) survivingOldDocIds.add(id);
@@ -443,7 +443,7 @@ export class SegmentManager {
 
     interface HeapEntry {
       segIndex: number;
-      termIter: Generator<DictEntry>;
+      termIter: Generator<DictEntry, void, unknown>;
       currentTerm: string;
     }
 
@@ -454,7 +454,7 @@ export class SegmentManager {
     });
 
     for (let si = 0; si < toMerge.length; si++) {
-      const termIter = toMerge[si].terms() as Generator<DictEntry>;
+      const termIter = toMerge[si].terms();
       const first = termIter.next();
       if (!first.done) {
         heap.push({ segIndex: si, termIter, currentTerm: first.value.term });

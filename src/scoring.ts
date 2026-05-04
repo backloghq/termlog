@@ -54,8 +54,8 @@ export function bm25Score(
  * BM25 ranker — wraps the OR query iterator and scores each candidate document.
  *
  * Usage:
- *   const ranker = new BM25Ranker(segments, { N, totalLen });
- *   const results = ranker.score(terms, { limit: 10 });
+ *   const ranker = new BM25Ranker({ k1: 1.2, b: 0.75 });
+ *   const results = ranker.score(terms, segments, N, totalLen, limit);
  *
  * The caller must supply `N` (total doc count) and `totalLen` (sum of all doc
  * lengths) because those statistics live in the manifest, not in individual

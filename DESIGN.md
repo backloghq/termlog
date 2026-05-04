@@ -112,23 +112,32 @@ interface StorageBackend {
 - Manifest update is atomic via rename.
 - CRC32 footers detect on-disk corruption; corrupted segments fail loudly on first read.
 
-## Public API (incremental)
+## Public API (v0.1.0 — shipped)
 
 ```ts
 class TermLog {
-  constructor(opts: { dir: string; tokenizer?: Tokenizer; backend?: StorageBackend; mergeThreshold?: number });
-  open(): Promise<void>;
-  close(): Promise<void>;
+  static async open(opts: TermLogOptions): Promise<TermLog>;
+  async close(): Promise<void>;
 
-  add(docId: string, text: string): Promise<void>;
-  remove(docId: string): Promise<void>;
-  search(query: string, opts?: { limit?: number; mode?: "and" | "or" }): Promise<Array<{ docId: string; score: number }>>;
-  compact(): Promise<void>;
+  async add(docId: string, text: string): Promise<void>;
+  async remove(docId: string): Promise<void>;
+  async search(query: string, opts?: { limit?: number; mode?: "and" | "or" }): Promise<Array<{ docId: string; score: number }>>;
+  async flush(): Promise<void>;
+  async compact(): Promise<void>;
 
   // Stats
   docCount(): number;
   segmentCount(): number;
-  estimatedBytes(): number;
+}
+
+interface TermLogOptions {
+  dir: string;
+  backend?: StorageBackend;   // defaults to FsBackend
+  tokenizer?: Tokenizer;      // defaults to UnicodeTokenizer
+  flushThreshold?: number;
+  mergeThreshold?: number;
+  k1?: number;                // BM25 k1, default 1.2
+  b?: number;                 // BM25 b, default 0.75
 }
 ```
 
