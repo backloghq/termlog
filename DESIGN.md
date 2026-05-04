@@ -61,7 +61,7 @@ Size-tiered LSM merge:
 - After each flush, `chooseCompactionTargets()` finds the lowest tier with `>= fanout` segments and merges exactly `fanout` of them into a single new segment at `tier + 1`.
 - This cascades: after the merge completes, if the resulting tier now has `>= fanout` segments, another merge fires — and so on until no tier is eligible.
 - Write amplification is bounded by `O(N log_{fanout} N)`: each document passes through at most `log_{fanout}(N)` merge levels. With fanout=4 and N=1M that is 10 levels (vs unbounded for naive merge-all).
-- During merge, doc IDs are re-numbered into a dense range per segment; old segments are deleted only after the merged segment is committed via manifest swap.
+- During merge, original doc IDs are preserved — the segment format supports sparse uint32 docIds natively. Old segments are deleted only after the merged segment is committed via manifest swap. Tombstones targeting docs in unmerged segments are carried forward on the merged output.
 - Compaction is non-blocking for reads (segments are immutable; readers hold a manifest snapshot).
 - Manual `compact()` merges all segments into one (output tier = maxExistingTier + 1). Useful for pre-warming read-heavy deployments.
 - **fanout** is configurable via `SegmentManagerOpts.fanout` (default 4). `mergeThreshold` is kept for backward compatibility and used as fanout when `fanout` is not set.
@@ -109,7 +109,16 @@ interface StorageBackend {
 }
 ```
 
-`FsBackend` ships with termlog; users plug in `@backloghq/opslog-s3`'s `S3Backend` for S3-backed indexes.
+`FsBackend` ships with termlog. For S3-backed indexes, use the included `S3StorageAdapter`:
+
+```ts
+import { S3StorageAdapter } from "@backloghq/termlog/s3";
+
+const tl = await TermLog.open({
+  dir: "my-index",
+  backend: new S3StorageAdapter({ bucket: "my-bucket", prefix: "my-index/", region: "us-east-1" }),
+});
+```
 
 ## Crash recovery
 

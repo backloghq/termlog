@@ -185,3 +185,99 @@ describe("TermLog facade", () => {
       .rejects.toMatchObject({ name: "MappingCorruptionError" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// BLOCKER 1 — facade round-trip integrity after compaction
+//
+// Verifies that compaction preserves original numIds so TermLog.search returns
+// the correct string docId for every surviving document. Densification would
+// break this because numToStr maps the original numId, not a renumbered one.
+// ---------------------------------------------------------------------------
+describe("TermLog — facade round-trip after compact", () => {
+  it("search returns correct string docId for all docs after compact with removal", async () => {
+    // One segment per add (flushThreshold=1), fanout=999 to suppress auto-compact.
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1, fanout: 999 });
+    for (let i = 0; i < 10; i++) {
+      await tl.add(`doc-${i}`, `unique content for document number ${i} word${i}`);
+    }
+
+    // Remove doc-3 (creates a tombstone segment).
+    await tl.remove("doc-3");
+    await tl.flush();
+
+    // Compact all segments into one.
+    await tl.compact();
+
+    // Every surviving doc must be searchable and return the correct string id.
+    for (let i = 0; i < 10; i++) {
+      if (i === 3) continue; // removed
+      const results = await tl.search(`word${i}`);
+      const ids = results.map((r) => r.docId);
+      expect(ids, `doc-${i} not found after compact`).toContain(`doc-${i}`);
+      expect(ids, `doc-3 resurected in search for word${i}`).not.toContain("doc-3");
+    }
+  });
+
+  it("removed doc does not resurface after multi-tier cascade compact", async () => {
+    // fanout=2 forces aggressive cascading.
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1, fanout: 2 });
+    for (let i = 0; i < 8; i++) {
+      await tl.add(`doc-${i}`, `token${i} shared`);
+    }
+    await tl.remove("doc-5");
+    await tl.flush();
+    await tl.compact();
+
+    const shared = await tl.search("shared");
+    const ids = shared.map((r) => r.docId);
+    expect(ids).not.toContain("doc-5");
+    for (let i = 0; i < 8; i++) {
+      if (i === 5) continue;
+      expect(ids, `doc-${i} missing after compact`).toContain(`doc-${i}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLOCKER 2 — tombstone carry-forward across partial merges
+//
+// Verifies that when a tombstone in a merged segment targets a doc in an
+// UNMERGED segment, the tombstone is preserved in the merged output so the
+// doc is still excluded from queries after the partial merge.
+// ---------------------------------------------------------------------------
+describe("TermLog — tombstone carry-forward across partial merge", () => {
+  it("tombstone targeting doc in unmerged segment is applied after partial compact", async () => {
+    // Strategy: add docs so they land in specific segments, remove one, then
+    // trigger a partial merge that does NOT include the segment holding the
+    // tombstone's target doc. The tombstone must survive on the merged segment.
+    //
+    // With fanout=4 and flushThreshold=1:
+    //   add doc-0..doc-3 → flush each → 4 tier-0 segs → cascade merges to 1 tier-1
+    //   add doc-4..doc-7 → flush each → 4 tier-0 segs → cascade merges to 1 tier-1
+    //   Now: [tier-1(docs 0-3), tier-1(docs 4-7)]
+    //   remove doc-6 → tombstone goes into next flush
+    //   add doc-8 → flushes, tombstone is in that tier-0 seg
+    //   compact() merges everything
+    //   → doc-6 must not appear in search results
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 1, fanout: 4 });
+
+    for (let i = 0; i < 8; i++) {
+      await tl.add(`doc-${i}`, `word${i} shared`);
+    }
+
+    await tl.remove("doc-6");
+    await tl.add("doc-8", "word8 shared");
+
+    await tl.compact();
+
+    const results = await tl.search("shared");
+    const ids = results.map((r) => r.docId);
+    expect(ids).not.toContain("doc-6");
+
+    // All other docs must be present.
+    for (let i = 0; i < 9; i++) {
+      if (i === 6) continue;
+      expect(ids, `doc-${i} missing`).toContain(`doc-${i}`);
+    }
+  });
+});

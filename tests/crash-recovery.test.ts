@@ -189,6 +189,81 @@ describe("Scenario 5 — manifest JSON corruption", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BLOCKER 3a — manifest references a missing segment file
+// Expect SegmentCorruptionError(region="footer"), not raw ENOENT.
+// ---------------------------------------------------------------------------
+describe("Scenario 6 — manifest references missing segment file", () => {
+  it("throws SegmentCorruptionError(footer) when referenced .seg is deleted before reopen", async () => {
+    // Build a 1-segment index.
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1 });
+    await mgr.add(0, [{ term: "data", tf: 1 }]);
+
+    // Find the .seg file and delete it while keeping the manifest.
+    const files = await readdir(dir);
+    const segFile = files.find((f) => f.endsWith(".seg"));
+    expect(segFile).toBeDefined();
+    const { unlink } = await import("node:fs/promises");
+    await unlink(join(dir, segFile!));
+
+    // Reopen — must throw SegmentCorruptionError with region="footer".
+    await expect(SegmentManager.open({ backend })).rejects.toMatchObject({
+      name: "SegmentCorruptionError",
+      region: "footer",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLOCKER 3b — mid-compaction crash: manifest committed, old segs not deleted
+// Simulate by manually writing pre-compact segs back after compact and
+// asserting recoverOrphans deletes them on next reopen.
+// ---------------------------------------------------------------------------
+describe("Scenario 7 — mid-compaction crash: manifest committed, old segs survive", () => {
+  it("recoverOrphans deletes pre-compact segments that are no longer in the manifest", async () => {
+    // Build 3 segments.
+    let mgr = await SegmentManager.open({ backend, flushThreshold: 1 });
+    await mgr.add(0, [{ term: "a", tf: 1 }]);
+    await mgr.add(1, [{ term: "b", tf: 1 }]);
+    await mgr.add(2, [{ term: "c", tf: 1 }]);
+
+    // Note which .seg files exist before compact.
+    const beforeFiles = (await readdir(dir)).filter((f) => f.endsWith(".seg"));
+
+    // Compact: manifest is updated to reference merged segment; old segs are deleted.
+    await mgr.compact();
+    await mgr.close();
+
+    // Simulate "old segs not yet deleted" by writing them back as orphans.
+    const orphanWriter = new SegmentWriter();
+    orphanWriter.addPosting("orphan", 999, 1);
+    orphanWriter.setDocLength(999, 1);
+    // Restore the old seg names as orphans (they're not in the manifest).
+    for (const f of beforeFiles) {
+      const id = f.slice(0, -4); // strip ".seg"
+      await (new SegmentWriter()).flush(id, backend).catch(() => {
+        // Flush will throw if SegmentWriter has no data — use orphanWriter.
+      });
+    }
+    // Simpler: just write garbage files with the old names.
+    for (const f of beforeFiles) {
+      await writeFile(join(dir, f), Buffer.from("orphan-data"));
+    }
+
+    // Reopen: recoverOrphans must delete the orphans (they're not in the manifest).
+    mgr = await SegmentManager.open({ backend });
+    const afterFiles = (await readdir(dir)).filter((f) => f.endsWith(".seg"));
+
+    // None of the pre-compact seg names should survive.
+    for (const f of beforeFiles) {
+      expect(afterFiles, `orphan ${f} was not cleaned up`).not.toContain(f);
+    }
+    // The merged segment is still there.
+    expect(mgr.segments()).toHaveLength(1);
+    await mgr.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Real-FS integration: add + flush without crash, reopen, verify consistency.
 // (Complements the mock-state tests above with a true open → write → reopen cycle.)
 // ---------------------------------------------------------------------------

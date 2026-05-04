@@ -23,7 +23,7 @@
 
 import { open as fsOpen, readFile as fsReadFile, unlink as fsUnlink } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
-import { SegmentWriter, SegmentReader } from "./segment.js";
+import { SegmentWriter, SegmentReader, SegmentCorruptionError } from "./segment.js";
 import { MinHeap } from "./heap.js";
 import type { StorageBackend } from "./storage.js";
 import type { DictEntry } from "./term-dict.js";
@@ -285,12 +285,19 @@ export class SegmentManager {
     this.nextSegCounter = manifest.generation + 1;
 
     // Open a SegmentReader for each referenced segment.
-    // Scenario 4: if any segment is corrupt, SegmentReader.open throws
-    // SegmentCorruptionError — propagate to caller.
+    // Missing segments (ENOENT) are re-thrown as SegmentCorruptionError so callers
+    // get a typed error instead of a raw OS error.
     const readers: SegmentReader[] = [];
     for (const entry of manifest.segments) {
-      const reader = await SegmentReader.open(`${entry.id}.seg`, this.backend);
-      readers.push(reader);
+      try {
+        const reader = await SegmentReader.open(`${entry.id}.seg`, this.backend);
+        readers.push(reader);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new SegmentCorruptionError("footer", `segment file missing: ${entry.id}.seg`);
+        }
+        throw err;
+      }
     }
     this.readerSnapshot = readers;
   }
@@ -488,11 +495,18 @@ export class SegmentManager {
    *
    * Algorithm:
    *   1. Build union tombstone set across merged segments.
-   *   2. Build docId renumber map using sidecar (O(docs), no posting decodes).
+   *   2. Collect surviving docs (original docIds preserved — no renumbering).
    *   3. K-way merge posting iterators by (term, segIndex) lex order.
    *   4. Write merged segment atomically (.seg.tmp → rename).
    *   5. Atomic manifest swap: merged segment + any segments not in the merge set.
-   *   6. Delete old segment files post-commit.
+   *   6. Carry forward tombstones that target docs in unmerged segments.
+   *   7. Delete old segment files post-commit.
+   *
+   * DocIds are NEVER renumbered. TermLog assigns globally unique numIds; the
+   * segment format supports sparse uint32 docIds natively (sidecar stores
+   * [(docId, length)] pairs; postings use delta-encoded VByte). Preserving
+   * original docIds is what keeps TermLog.numToStr lookups correct after merge
+   * and ensures tombstones (which store original numIds) always match.
    */
   private async tieredCompactLocked(indices: number[], outputTier: number): Promise<void> {
     if (indices.length <= 1) return;
@@ -510,41 +524,16 @@ export class SegmentManager {
       for (const id of seg.tombstones) tombstoneUnion.add(id);
     }
 
-    // --- Step 1: build per-segment docId renumber maps using sidecar — O(docs) ---
-    //
-    // Each segment has its own internal docId space (both originals from the writer and
-    // previously-merged segments renumber to [0, N)). We assign each segment a base offset
-    // in the global space so IDs from different segments never collide:
-    //   globalId = segmentBase[si] + localDocId
-    //
-    // After computing the global space, surviving docs are renumbered densely.
-    const segmentBase: number[] = [];
-    let baseOffset = 0;
+    // Collect surviving docs: original docId → length (no renumbering).
+    // tombstoneUnion contains original numIds; localId IS the original numId
+    // because TermLog allocates globally unique numIds and we never renumber.
+    const survivingDocs = new Map<number, number>(); // docId → len
     for (const seg of toMergeReaders) {
-      segmentBase.push(baseOffset);
-      baseOffset += seg.docCount;
-    }
-
-    // Collect (globalId, len) for all surviving docs.
-    const survivingDocs = new Map<number, number>(); // globalId → len
-    for (let si = 0; si < toMergeReaders.length; si++) {
-      const base = segmentBase[si];
-      for (const [localId, len] of toMergeReaders[si].docLenEntries()) {
-        const globalId = base + localId;
-        if (!tombstoneUnion.has(localId)) {
-          survivingDocs.set(globalId, len);
+      for (const [docId, len] of seg.docLenEntries()) {
+        if (!tombstoneUnion.has(docId)) {
+          survivingDocs.set(docId, len);
         }
       }
-    }
-
-    const oldIds = [...survivingDocs.keys()].sort((a, b) => a - b);
-    const remapGlobal2New = new Map<number, number>();
-    oldIds.forEach((globalId, newId) => remapGlobal2New.set(globalId, newId));
-
-    const docLenMap = new Map<number, number>();
-    for (const [globalId, len] of survivingDocs) {
-      const newId = remapGlobal2New.get(globalId);
-      if (newId !== undefined) docLenMap.set(newId, len);
     }
 
     // --- Step 2: streaming k-way merge of term iterators into SegmentWriter ---
@@ -578,8 +567,8 @@ export class SegmentManager {
 
     const flushTerm = () => {
       if (prevTerm === null || termAccum.size === 0) return;
-      for (const [newId, tf] of termAccum) {
-        writer.addPosting(prevTerm, newId, tf);
+      for (const [docId, tf] of termAccum) {
+        writer.addPosting(prevTerm, docId, tf);
       }
     };
 
@@ -594,14 +583,12 @@ export class SegmentManager {
 
       while (heap.size > 0 && heap.peek()!.currentTerm === prevTerm) {
         const entry = heap.pop()!;
-        const base = segmentBase[entry.segIndex];
         const postIter = toMergeReaders[entry.segIndex].postings(prevTerm!);
         let posting = postIter.next();
         while (!posting.done) {
-          const globalId = base + posting.value.docId;
-          const newId = remapGlobal2New.get(globalId);
-          if (newId !== undefined) {
-            termAccum.set(newId, (termAccum.get(newId) ?? 0) + posting.value.tf);
+          const docId = posting.value.docId;
+          if (survivingDocs.has(docId)) {
+            termAccum.set(docId, (termAccum.get(docId) ?? 0) + posting.value.tf);
           }
           posting = postIter.next();
         }
@@ -614,8 +601,19 @@ export class SegmentManager {
     }
     flushTerm();
 
-    for (const [newId, len] of docLenMap) {
-      writer.setDocLength(newId, len);
+    for (const [docId, len] of survivingDocs) {
+      writer.setDocLength(docId, len);
+    }
+
+    // Carry forward tombstones that target docs NOT in the merged segments.
+    // These tombstones target docs in unmerged segments and must not be dropped.
+    const mergedDocIds = new Set<number>();
+    for (const seg of toMergeReaders) {
+      for (const [docId] of seg.docLenEntries()) mergedDocIds.add(docId);
+    }
+    const unresolvedTombstones = [...tombstoneUnion].filter((id) => !mergedDocIds.has(id));
+    if (unresolvedTombstones.length > 0) {
+      writer.setTombstones(unresolvedTombstones);
     }
 
     await writer.flush(mergedId, this.backend);
@@ -623,8 +621,8 @@ export class SegmentManager {
     // --- Step 3: atomic manifest swap ---
     const mergedEntry: ManifestSegmentEntry = {
       id: mergedId,
-      docCount: oldIds.length,
-      totalLen: [...docLenMap.values()].reduce((s, l) => s + l, 0),
+      docCount: survivingDocs.size,
+      totalLen: [...survivingDocs.values()].reduce((s, l) => s + l, 0),
       tier: outputTier,
     };
 
