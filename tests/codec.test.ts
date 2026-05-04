@@ -98,7 +98,7 @@ describe("encodePostings / decodePostings — round-trip", () => {
   });
 
   it("tf = 65535 round-trips", () => {
-    const { docIds, tfs } = decodePostings(encodePostings([7], [65535]));
+    const { tfs } = decodePostings(encodePostings([7], [65535]));
     expect(tfs).toEqual([65535]);
   });
 
