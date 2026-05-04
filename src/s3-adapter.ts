@@ -24,7 +24,7 @@
  * lock. You must ensure at most one writer per (bucket, prefix) combination.
  */
 
-import type { StorageBackend } from "./storage.js";
+import type { StorageBackend, WriteStream } from "./storage.js";
 
 /** Minimal S3 operation shapes — compatible with AWS SDK v3 and equivalents. */
 export interface S3GetObjectOutput {
@@ -37,6 +37,14 @@ export interface S3ListObjectsOutput {
   NextContinuationToken?: string;
 }
 
+export interface S3CreateMultipartUploadOutput {
+  UploadId?: string;
+}
+
+export interface S3UploadPartOutput {
+  ETag?: string;
+}
+
 export interface S3Client {
   send(command: object): Promise<unknown>;
 }
@@ -46,6 +54,11 @@ export interface S3CommandConstructors {
   PutObjectCommand: new (input: { Bucket: string; Key: string; Body: Uint8Array; ContentType?: string }) => object;
   DeleteObjectCommand: new (input: { Bucket: string; Key: string }) => object;
   ListObjectsV2Command: new (input: { Bucket: string; Prefix?: string; ContinuationToken?: string }) => object;
+  /** Optional — required only for createWriteStream (multipart upload). */
+  CreateMultipartUploadCommand?: new (input: { Bucket: string; Key: string; ContentType?: string }) => object;
+  UploadPartCommand?: new (input: { Bucket: string; Key: string; UploadId: string; PartNumber: number; Body: Uint8Array }) => object;
+  CompleteMultipartUploadCommand?: new (input: { Bucket: string; Key: string; UploadId: string; MultipartUpload: { Parts: Array<{ PartNumber: number; ETag: string }> } }) => object;
+  AbortMultipartUploadCommand?: new (input: { Bucket: string; Key: string; UploadId: string }) => object;
 }
 
 export interface S3StorageAdapterOpts {
@@ -166,4 +179,65 @@ export class S3StorageAdapter implements StorageBackend {
 
   // appendBlob intentionally not implemented — S3 has no native append.
   // saveDocIds() falls back to read-modify-write automatically.
+
+  async createWriteStream(path: string): Promise<WriteStream> {
+    const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand } = this.commands;
+    if (!CreateMultipartUploadCommand || !UploadPartCommand || !CompleteMultipartUploadCommand || !AbortMultipartUploadCommand) {
+      throw new Error(
+        "S3StorageAdapter.createWriteStream requires CreateMultipartUploadCommand, UploadPartCommand, " +
+        "CompleteMultipartUploadCommand, and AbortMultipartUploadCommand in the commands object.",
+      );
+    }
+
+    const key = this.key(path);
+    const { client, bucket } = this;
+    const MIN_PART_SIZE = 5 * 1024 * 1024; // 5 MiB S3 multipart minimum
+
+    const initOutput = await client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: key, ContentType: "application/octet-stream" }),
+    ) as S3CreateMultipartUploadOutput;
+    const uploadId = initOutput.UploadId!;
+
+    const parts: Array<{ PartNumber: number; ETag: string }> = [];
+    let partNumber = 1;
+    let partBuffer: Buffer[] = [];
+    let bufferedSize = 0;
+    let done = false;
+
+    const flush = async (force: boolean): Promise<void> => {
+      if (bufferedSize === 0) return;
+      if (!force && bufferedSize < MIN_PART_SIZE) return;
+      const partData = Buffer.concat(partBuffer);
+      partBuffer = [];
+      bufferedSize = 0;
+      const out = await client.send(
+        new UploadPartCommand({ Bucket: bucket, Key: key, UploadId: uploadId, PartNumber: partNumber, Body: partData }),
+      ) as S3UploadPartOutput;
+      parts.push({ PartNumber: partNumber, ETag: out.ETag ?? "" });
+      partNumber++;
+    };
+
+    return {
+      async write(chunk: Buffer): Promise<void> {
+        partBuffer.push(chunk);
+        bufferedSize += chunk.length;
+        await flush(false);
+      },
+      async end(): Promise<void> {
+        if (done) return;
+        done = true;
+        await flush(true);
+        await client.send(
+          new CompleteMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId, MultipartUpload: { Parts: parts } }),
+        );
+      },
+      async abort(): Promise<void> {
+        if (done) return;
+        done = true;
+        await client.send(
+          new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
+        ).catch(() => undefined);
+      },
+    };
+  }
 }
