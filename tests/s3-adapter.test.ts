@@ -147,3 +147,81 @@ describe("S3StorageAdapter — no prefix", () => {
     expect(store.has("manifest.json")).toBe(true);
   });
 });
+
+describe("S3StorageAdapter — pagination", () => {
+  it("listBlobs follows IsTruncated / NextContinuationToken across two pages", async () => {
+    const store = new Map<string, Buffer>();
+
+    // Build 1500 keys spread across two pages.
+    const allKeys: string[] = [];
+    for (let i = 0; i < 1500; i++) {
+      const key = `idx/seg-${String(i).padStart(6, "0")}.seg`;
+      store.set(key, Buffer.from("x"));
+      allKeys.push(`seg-${String(i).padStart(6, "0")}.seg`);
+    }
+
+    const PAGE_SIZE = 1000;
+    let callCount = 0;
+
+    class GetObjectCommand { constructor(public input: { Bucket: string; Key: string }) {} }
+    class PutObjectCommand { constructor(public input: { Bucket: string; Key: string; Body: Uint8Array }) {} }
+    class DeleteObjectCommand { constructor(public input: { Bucket: string; Key: string }) {} }
+    class ListObjectsV2Command { constructor(public input: { Bucket: string; Prefix?: string; ContinuationToken?: string }) {} }
+
+    const client: S3Client = {
+      async send(cmd: object): Promise<unknown> {
+        if (cmd instanceof ListObjectsV2Command) {
+          callCount++;
+          const prefix = cmd.input.Prefix ?? "";
+          const matching = [...store.keys()].filter((k) => k.startsWith(prefix));
+          const token = cmd.input.ContinuationToken ? parseInt(cmd.input.ContinuationToken, 10) : 0;
+          const page = matching.slice(token, token + PAGE_SIZE);
+          const nextToken = token + PAGE_SIZE;
+          const isTruncated = nextToken < matching.length;
+          return {
+            Contents: page.map((k) => ({ Key: k })),
+            IsTruncated: isTruncated,
+            NextContinuationToken: isTruncated ? String(nextToken) : undefined,
+          };
+        }
+        throw new Error(`Unexpected command`);
+      },
+    };
+
+    const commands = { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command };
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "idx/" });
+
+    const result = await adapter.listBlobs("seg-");
+    expect(result).toHaveLength(1500);
+    expect(callCount).toBe(2); // exactly two pages
+    // All keys must be present (order may vary).
+    expect(result.sort()).toEqual(allKeys.sort());
+  });
+});
+
+describe("S3StorageAdapter — error propagation", () => {
+  it("readBlob propagates non-NoSuchKey errors unchanged", async () => {
+    class GetObjectCommand { constructor(public input: { Bucket: string; Key: string }) {} }
+    class PutObjectCommand { constructor(public input: { Bucket: string; Key: string; Body: Uint8Array }) {} }
+    class DeleteObjectCommand { constructor(public input: { Bucket: string; Key: string }) {} }
+    class ListObjectsV2Command { constructor(public input: { Bucket: string; Prefix?: string; ContinuationToken?: string }) {} }
+
+    const accessDenied = new Error("Access Denied") as Error & { name: string };
+    accessDenied.name = "AccessDenied";
+
+    const client: S3Client = {
+      async send(cmd: object): Promise<unknown> {
+        if (cmd instanceof GetObjectCommand) throw accessDenied;
+        throw new Error("unexpected");
+      },
+    };
+
+    const commands = { GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command };
+    const adapter = new S3StorageAdapter({ client, commands, bucket: "b", prefix: "idx/" });
+
+    const err = await adapter.readBlob("some.seg").catch((e) => e) as Error & { name: string };
+    // Must not be silently converted to ENOENT — the original error propagates.
+    expect(err.name).toBe("AccessDenied");
+    expect((err as NodeJS.ErrnoException).code).not.toBe("ENOENT");
+  });
+});

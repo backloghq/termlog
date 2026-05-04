@@ -168,4 +168,34 @@ describe("postingIterator", () => {
     iter.next(); // consume
     expect(iter.next().done).toBe(true);
   });
+
+  it("randomized round-trip: 1000 iterations of random sorted docId arrays and tfs", () => {
+    const RNG_SEED = 42;
+    let seed = RNG_SEED;
+    const rand = () => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return (seed >>> 0) / 0x100000000;
+    };
+
+    for (let iter = 0; iter < 1000; iter++) {
+      const count = Math.floor(rand() * 20) + 1; // 1..20 entries
+      const docIds: number[] = [];
+      let last = 0;
+      for (let i = 0; i < count; i++) {
+        last += Math.floor(rand() * 1000) + 1; // strictly increasing
+        docIds.push(last);
+      }
+      const tfs = docIds.map(() => Math.floor(rand() * 255) + 1);
+
+      const buf = encodePostings(docIds, tfs);
+      const decoded = decodePostings(buf);
+
+      expect(decoded.docIds).toHaveLength(count);
+      expect(decoded.tfs).toHaveLength(count);
+      for (let i = 0; i < count; i++) {
+        expect(decoded.docIds[i]).toBe(docIds[i]);
+        expect(decoded.tfs[i]).toBe(tfs[i]);
+      }
+    }
+  });
 });

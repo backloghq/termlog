@@ -283,8 +283,10 @@ export class TermLog {
 
   /** Merge segments. Snapshots docIds after compact to bound log growth. */
   async compact(): Promise<void> {
-    await this.mgr.compact();
-    await this.snapshotDocIds();
+    return this.serialize(async () => {
+      await this.mgr.compact();
+      await this.snapshotDocIds();
+    });
   }
 
   /** Close: flush pending writes and release the advisory lock. */

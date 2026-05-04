@@ -656,7 +656,7 @@ export class SegmentManager {
    * mutations would corrupt internal state. Treat it as readonly.
    */
   segments(): readonly SegmentReader[] {
-    return this.readerSnapshot;
+    return Object.freeze(this.readerSnapshot.slice());
   }
 
   /** The manifest generation counter — incremented on every successful flush or compact. */

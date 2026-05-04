@@ -161,6 +161,54 @@ describe(`stress test — ${N.toLocaleString()} docs (STRESS=${IS_STRESS ? "1" :
 });
 
 // ---------------------------------------------------------------------------
+// Tiered cascade — small-N variant runs unconditionally in CI
+// ---------------------------------------------------------------------------
+
+describe("tiered cascade — CI (10k docs, fanout=4)", () => {
+  it("segment count stays within tier bound, tombstones respected, basic latency", async () => {
+    const N_CI = 10_000;
+    const FLUSH_CI = 500;
+    const FANOUT = 4;
+
+    const ciDir = await mkdtemp(join(tmpdir(), "termlog-tiered-ci-"));
+    const ciBackend = new FsBackend(ciDir);
+    const ciMgr = await SegmentManager.open({
+      backend: ciBackend,
+      flushThreshold: FLUSH_CI,
+      fanout: FANOUT,
+    });
+
+    for (let i = 0; i < N_CI; i++) {
+      await ciMgr.add(i, termsForDoc(i));
+    }
+    await ciMgr.flush();
+
+    // Segment count must be within theoretical tier bound.
+    const maxTiers = Math.ceil(Math.log(N_CI / FLUSH_CI) / Math.log(FANOUT));
+    const maxSegs = Math.pow(FANOUT, maxTiers);
+    expect(ciMgr.segments().length).toBeLessThanOrEqual(maxSegs);
+
+    // Tombstone a doc and verify it is excluded from query results.
+    const targetDocId = Math.floor(N_CI / 2);
+    await ciMgr.remove(targetDocId);
+    await ciMgr.flush();
+
+    const ranker = new BM25Ranker();
+    const targetTerm = termsForDoc(targetDocId)[0].term;
+    const results = ranker.score([targetTerm], ciMgr.segments(), ciMgr.indexTotalDocs, ciMgr.indexTotalLen);
+    expect(results.map((r) => r.docId)).not.toContain(targetDocId);
+
+    // Basic latency: 10-term OR query must complete in under 1s on any reasonable machine.
+    const t0 = performance.now();
+    ranker.score(VOCAB.slice(0, 10), ciMgr.segments(), ciMgr.indexTotalDocs, ciMgr.indexTotalLen, 10);
+    expect(performance.now() - t0).toBeLessThan(1000);
+
+    await ciMgr.close();
+    await rm(ciDir, { recursive: true, force: true });
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
 // Tiered cascade stress variant (STRESS_TIERED=1)
 // ---------------------------------------------------------------------------
 

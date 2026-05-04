@@ -77,9 +77,12 @@ describe("lockfile", () => {
     ).rejects.toMatchObject({ name: "IndexLockedError" });
   });
 
-  it("multi-process: child process spawned with node holds the lock; parent sees IndexLockedError", async () => {
-    // Spawn a real child process that acquires the lock and signals readiness,
-    // then the parent opens the same dir and expects IndexLockedError.
+  it("multi-process: child opens SegmentManager; parent sees IndexLockedError with child.pid", async () => {
+    // Child calls SegmentManager.open() for real, signals readiness via a file, then
+    // stays alive. Parent races a second open and asserts IndexLockedError.pid === child.pid.
+    const distDir = new URL("../dist", import.meta.url).pathname;
+    const readyFile = join(dir, "child-ready");
+
     await new Promise<void>((resolve, reject) => {
       const child = spawn(
         process.execPath,
@@ -87,31 +90,33 @@ describe("lockfile", () => {
           "--input-type=module",
           "--eval",
           [
-            `import { createRequire } from 'module';`,
-            `import { writeFileSync } from 'fs';`,
-            `// Signal readiness by writing our PID to a ready file`,
-            `writeFileSync('${join(dir, "child-ready")}', String(process.pid));`,
-            `// Keep alive for 5 seconds`,
-            `setTimeout(() => {}, 5000);`,
+            `import { SegmentManager } from '${distDir}/manager.js';`,
+            `import { FsBackend } from '${distDir}/storage.js';`,
+            `import { writeFileSync } from 'node:fs';`,
+            `const backend = new FsBackend('${dir}');`,
+            `SegmentManager.open({ dir: '${dir}', backend }).then(() => {`,
+            `  writeFileSync('${readyFile}', String(process.pid));`,
+            `  // Stay alive until killed`,
+            `  setTimeout(() => {}, 30000);`,
+            `}).catch((e) => { process.stderr.write(String(e)); process.exit(1); });`,
           ].join("\n"),
         ],
         { stdio: "pipe" },
       );
 
-      // Write a lock file with the child's PID once it's ready.
-      const pollReady = async () => {
-        for (let i = 0; i < 50; i++) {
+      child.stderr?.on("data", (d: Buffer) => reject(new Error(`child error: ${d.toString()}`)));
+
+      const pollReady = async (): Promise<number> => {
+        const { readFile } = await import("node:fs/promises");
+        for (let i = 0; i < 100; i++) {
           try {
-            const { readFile } = await import("node:fs/promises");
-            const pidStr = await readFile(join(dir, "child-ready"), "utf-8");
-            const childPid = parseInt(pidStr, 10);
-            await writeFile(join(dir, ".lock"), String(childPid), "utf-8");
-            return childPid;
+            const pidStr = await readFile(readyFile, "utf-8");
+            return parseInt(pidStr, 10);
           } catch {
             await new Promise((r) => setTimeout(r, 50));
           }
         }
-        throw new Error("child did not signal ready");
+        throw new Error("child did not signal ready within 5s");
       };
 
       pollReady().then(async (childPid) => {
@@ -133,5 +138,5 @@ describe("lockfile", () => {
         reject(err);
       });
     });
-  });
+  }, 15_000);
 });
