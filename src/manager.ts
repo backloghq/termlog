@@ -20,6 +20,8 @@
  *   6. Delete old segment files only after manifest commit.
  */
 
+import { open as fsOpen, readFile as fsReadFile, unlink as fsUnlink } from "node:fs/promises";
+import { join as pathJoin } from "node:path";
 import { SegmentWriter, SegmentReader } from "./segment.js";
 import { MinHeap } from "./heap.js";
 import type { StorageBackend } from "./storage.js";
@@ -56,6 +58,7 @@ interface BufferedDoc {
 const MANIFEST_VERSION = 1;
 const MANIFEST_FILE = "manifest.json";
 const MANIFEST_TMP = "manifest.tmp";
+const LOCK_FILE = ".lock";
 const DEFAULT_MERGE_THRESHOLD = 8;
 
 /** Thrown when manifest.json exists but cannot be parsed (scenario 5). */
@@ -66,8 +69,18 @@ export class ManifestCorruptionError extends Error {
   }
 }
 
+/** Thrown when another process holds the write lock on this index directory. */
+export class IndexLockedError extends Error {
+  constructor(public readonly pid: number) {
+    super(`Index is locked by process ${pid}. If stale, delete the .lock file.`);
+    this.name = "IndexLockedError";
+  }
+}
+
 export interface SegmentManagerOpts {
   backend: StorageBackend;
+  /** Directory on disk — required to enable the advisory .lock file (local FS only). */
+  dir?: string;
   /** How many buffered docs trigger an automatic flush. Default: 1000. */
   flushThreshold?: number;
   /** How many segments trigger automatic compaction. Default: 8. */
@@ -80,6 +93,8 @@ export class SegmentManager {
   private readonly flushThreshold: number;
   private readonly mergeThreshold: number;
   private readonly tokenizerConfig: TokenizerConfig;
+  /** Absolute path to the .lock file, or null for non-local-FS backends. */
+  private lockPath: string | null = null;
 
   private generation = 0;
   private manifestSegments: ManifestSegmentEntry[] = [];
@@ -122,9 +137,61 @@ export class SegmentManager {
       opts.mergeThreshold ?? DEFAULT_MERGE_THRESHOLD,
       opts.tokenizer ?? { kind: "unicode", minLen: 1 },
     );
+    // Acquire advisory lock for local FS backends to prevent multi-process corruption.
+    if (opts.dir && opts.backend.isLocalFs?.()) {
+      mgr.lockPath = pathJoin(opts.dir, LOCK_FILE);
+      await mgr.acquireLock();
+    }
     await mgr.loadManifest();
     await mgr.recoverOrphans();
     return mgr;
+  }
+
+  /** Release the advisory lock and flush any pending buffered writes. */
+  async close(): Promise<void> {
+    await this.flush();
+    await this.releaseLock();
+  }
+
+  private async acquireLock(): Promise<void> {
+    const lp = this.lockPath!;
+    // Try exclusive create (O_EXCL) — fails if lock file already exists.
+    try {
+      const fh = await fsOpen(lp, "wx");
+      await fh.writeFile(String(process.pid), "utf-8");
+      await fh.close();
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    // Lock file exists — check if the holder is still alive.
+    let content: string;
+    try {
+      content = await fsReadFile(lp, "utf-8");
+    } catch {
+      // File disappeared (race) — retry.
+      return this.acquireLock();
+    }
+    const pid = parseInt(content, 10);
+    if (!isNaN(pid)) {
+      try { process.kill(pid, 0); } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ESRCH") {
+          // Stale lock — remove and retry.
+          try { await fsUnlink(lp); } catch { /* already gone */ }
+          return this.acquireLock();
+        }
+      }
+      throw new IndexLockedError(pid);
+    }
+    // Unreadable/corrupt lock file — treat as stale.
+    try { await fsUnlink(lp); } catch { /* already gone */ }
+    return this.acquireLock();
+  }
+
+  private async releaseLock(): Promise<void> {
+    if (!this.lockPath) return;
+    try { await fsUnlink(this.lockPath); } catch { /* best-effort */ }
+    this.lockPath = null;
   }
 
   private async loadManifest(): Promise<void> {
@@ -137,9 +204,11 @@ export class SegmentManager {
     let raw: Buffer;
     try {
       raw = await this.backend.readBlob(MANIFEST_FILE);
-    } catch {
-      // No manifest yet — fresh index.
-      return;
+    } catch (err) {
+      // ENOENT = fresh index (no manifest yet). Any other error (EACCES, EIO, S3 5xx)
+      // must surface — silently treating it as a fresh index would wipe data.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
     }
 
     // Scenario 5: manifest.json exists but is corrupt JSON.
@@ -173,20 +242,21 @@ export class SegmentManager {
    */
   private async recoverOrphans(): Promise<void> {
     const referencedIds = new Set(this.manifestSegments.map((e) => e.id));
-    let allBlobs: string[];
-    try {
-      allBlobs = await this.backend.listBlobs("");
-    } catch {
-      return; // Backend can't list — skip cleanup.
-    }
 
-    for (const blob of allBlobs) {
-      // Delete any *.tmp (abandoned FsBackend atomic write or old manifest.tmp).
+    // Use prefix-scoped list calls so S3 backends don't pay full-bucket-list cost.
+    // Segments are always named "seg-*.seg" or "seg-*.seg.*.tmp".
+    let segBlobs: string[] = [];
+    try { segBlobs = await this.backend.listBlobs("seg-"); } catch { /* skip */ }
+
+    // Manifest temp files.
+    let manifestBlobs: string[] = [];
+    try { manifestBlobs = await this.backend.listBlobs("manifest"); } catch { /* skip */ }
+
+    for (const blob of [...segBlobs, ...manifestBlobs]) {
       if (blob.endsWith(".tmp")) {
         try { await this.backend.deleteBlob(blob); } catch { /* best-effort */ }
         continue;
       }
-      // Delete *.seg files not referenced by the manifest.
       if (blob.endsWith(".seg")) {
         const id = blob.slice(0, -4); // strip ".seg"
         if (!referencedIds.has(id)) {

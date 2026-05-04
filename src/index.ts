@@ -25,7 +25,7 @@ export { SegmentWriter, SegmentReader, SegmentCorruptionError } from "./segment.
 
 // Manager
 export type { ManifestSegmentEntry, TokenizerConfig, SegmentManagerOpts } from "./manager.js";
-export { SegmentManager, ManifestCorruptionError } from "./manager.js";
+export { SegmentManager, ManifestCorruptionError, IndexLockedError } from "./manager.js";
 
 // Query
 export type { QueryPosting } from "./query.js";

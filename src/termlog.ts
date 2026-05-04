@@ -68,6 +68,7 @@ export class TermLog {
 
     const mgr = await SegmentManager.open({
       backend,
+      dir: opts.dir,
       flushThreshold: opts.flushThreshold,
       mergeThreshold: opts.mergeThreshold,
     });
@@ -177,9 +178,9 @@ export class TermLog {
     await this.mgr.compact();
   }
 
-  /** Close: flush pending writes. */
+  /** Close: flush pending writes and release the advisory lock. */
   async close(): Promise<void> {
-    await this.mgr.flush();
+    await this.mgr.close();
     await this.saveDocIds();
   }
 
