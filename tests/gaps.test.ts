@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { rm, mkdtemp, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { crc32 } from "../src/crc32.js";
+import { crc32, Crc32Stream } from "../src/crc32.js";
 import { encodeVByte, decodeVByte } from "../src/codec.js";
 import { FsBackend } from "../src/storage.js";
 import { SegmentWriter, SegmentReader } from "../src/segment.js";
@@ -434,5 +434,60 @@ describe("docids.snap / manifest atomicity invariant", () => {
     const results = await tl2.search("hello");
     expect(results.map((r) => r.docId)).toContain("real-doc");
     await tl2.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Crc32Stream parity with one-shot crc32()
+// ---------------------------------------------------------------------------
+
+describe("Crc32Stream parity", () => {
+  function chunkedStream(buf: Buffer, chunkSizes: number[]): number {
+    const s = new Crc32Stream();
+    let offset = 0;
+    for (const size of chunkSizes) {
+      s.update(buf.subarray(offset, offset + size));
+      offset += size;
+    }
+    if (offset < buf.length) s.update(buf.subarray(offset));
+    return s.digest();
+  }
+
+  it("empty buffer → 0x00000000", () => {
+    const s = new Crc32Stream();
+    expect(s.digest()).toBe(0x00000000);
+  });
+
+  it("single-byte buffer [0x41] matches crc32()", () => {
+    const buf = Buffer.from([0x41]);
+    const s = new Crc32Stream();
+    s.update(buf);
+    expect(s.digest()).toBe(crc32(buf));
+  });
+
+  it("all-0xFF buffer (256 bytes) matches crc32()", () => {
+    const buf = Buffer.alloc(256, 0xff);
+    const s = new Crc32Stream();
+    s.update(buf);
+    expect(s.digest()).toBe(crc32(buf));
+  });
+
+  it("chunked 1-byte pieces match crc32() of whole buffer", () => {
+    const buf = Buffer.from("the quick brown fox", "ascii");
+    const sizes = Array.from({ length: buf.length }, () => 1);
+    expect(chunkedStream(buf, sizes)).toBe(crc32(buf));
+  });
+
+  it("chunked varying-size pieces match crc32() of whole buffer", () => {
+    const buf = Buffer.from("hello termlog streaming crc32 parity test", "ascii");
+    expect(chunkedStream(buf, [3, 7, 1, 10, 20])).toBe(crc32(buf));
+  });
+
+  it("known-vector: \"123\" → 0x884863d2", () => {
+    const s = new Crc32Stream();
+    s.update(Buffer.from("1", "ascii"));
+    s.update(Buffer.from("2", "ascii"));
+    s.update(Buffer.from("3", "ascii"));
+    expect(s.digest()).toBe(0x884863d2);
   });
 });

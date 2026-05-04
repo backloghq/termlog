@@ -244,4 +244,171 @@ describe("SegmentWriter — docIds sorted within term", () => {
     expect(docIds).toEqual([10, 50, 100]);
     expect(tfs).toEqual([3, 2, 1]);
   });
+
+  it("writeTerm throws RangeError on out-of-order term", async () => {
+    const stream = await backend.createWriteStream("seg-ooo.seg");
+    const w = new SegmentWriter(stream);
+    await w.writeTerm("b", [0], [1]);
+    await expect(w.writeTerm("a", [1], [1])).rejects.toThrow(RangeError);
+    await stream.abort();
+  });
+
+  it("writeTerm throws RangeError on duplicate term", async () => {
+    const stream = await backend.createWriteStream("seg-dup.seg");
+    const w = new SegmentWriter(stream);
+    await w.writeTerm("same", [0], [1]);
+    await expect(w.writeTerm("same", [1], [1])).rejects.toThrow(RangeError);
+    await stream.abort();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Randomized fuzz: 1000 round-trips over random sorted-term corpora
+// ---------------------------------------------------------------------------
+
+describe("SegmentWriter + SegmentReader — fuzz round-trip", () => {
+  let dir: string;
+  let backend: FsBackend;
+
+  beforeEach(async () => {
+    dir = await makeTmpDir();
+    backend = new FsBackend(dir);
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("1000 random sorted-term corpora round-trip identically", async () => {
+    // Deterministic PRNG (xorshift32) for reproducibility.
+    let seed = 0xdeadbeef;
+    const rand = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0); };
+    const randInt = (max: number) => rand() % max;
+
+    for (let iter = 0; iter < 1000; iter++) {
+      const segId = `fuzz-${iter}`;
+      const termCount = randInt(20); // 0..19 terms
+      const docCount = randInt(10) + 1; // 1..10 docs
+      const tombstoneCount = randInt(3); // 0..2 tombstones
+
+      // Build unique sorted terms.
+      const terms = [...new Set(
+        Array.from({ length: termCount }, (_, i) => `t${String(i + iter * 100).padStart(6, "0")}`),
+      )].sort();
+
+      // For each term, pick a random sorted subset of docIds with random tfs.
+      const corpus = new Map<string, { docIds: number[]; tfs: number[] }>();
+      for (const term of terms) {
+        const docIds: number[] = [];
+        const tfs: number[] = [];
+        let prev = -1;
+        for (let d = 0; d < docCount; d++) {
+          if (rand() % 2 === 0) {
+            const docId = prev + 1 + randInt(100);
+            const tf = randInt(5) + 1;
+            docIds.push(docId);
+            tfs.push(tf);
+            prev = docId;
+          }
+        }
+        if (docIds.length > 0) corpus.set(term, { docIds, tfs });
+      }
+
+      // Doc lengths (including some large sparse docIds).
+      const docLens = new Map<number, number>();
+      for (let d = 0; d < docCount; d++) {
+        const sparse = [d, d * 1000, d * 1_000_000][rand() % 3];
+        docLens.set(sparse, randInt(50) + 1);
+      }
+
+      // Tombstones (docIds not in corpus).
+      const tombstones: number[] = [];
+      for (let t = 0; t < tombstoneCount; t++) tombstones.push(900000 + t);
+
+      const stream = await backend.createWriteStream(`${segId}.seg`);
+      const w = new SegmentWriter(stream);
+      for (const [docId, len] of docLens) w.setDocLength(docId, len);
+      if (tombstones.length > 0) w.setTombstones(tombstones);
+      for (const [term, { docIds, tfs }] of corpus) await w.writeTerm(term, docIds, tfs);
+      await w.finish();
+
+      const r = await SegmentReader.open(`${segId}.seg`, backend);
+
+      // Verify all postings.
+      for (const [term, { docIds, tfs }] of corpus) {
+        const got = r.decodePostings(term);
+        expect(got.docIds, `iter=${iter} term=${term}`).toEqual(docIds);
+        expect(got.tfs, `iter=${iter} term=${term}`).toEqual(tfs);
+      }
+
+      // Verify doc lengths.
+      for (const [docId, len] of docLens) {
+        expect(r.docLen(docId), `iter=${iter} docId=${docId}`).toBe(len);
+      }
+
+      // Verify tombstones.
+      for (const t of tombstones) {
+        expect(r.isTombstoned(t), `iter=${iter} tombstone=${t}`).toBe(true);
+      }
+      expect(r.isTombstoned(999999)).toBe(false);
+    }
+  }, 30000);
+
+  it("zero-term segment round-trips (empty index)", async () => {
+    const stream = await backend.createWriteStream("fuzz-zero-term.seg");
+    const w = new SegmentWriter(stream);
+    w.setDocLength(0, 5);
+    await w.finish();
+
+    const r = await SegmentReader.open("fuzz-zero-term.seg", backend);
+    expect(r.termCount).toBe(0);
+    expect(r.decodePostings("anything")).toEqual({ docIds: [], tfs: [] });
+  });
+
+  it("zero-doc zero-term segment round-trips", async () => {
+    const stream = await backend.createWriteStream("fuzz-empty.seg");
+    const w = new SegmentWriter(stream);
+    await w.finish();
+
+    const r = await SegmentReader.open("fuzz-empty.seg", backend);
+    expect(r.termCount).toBe(0);
+    expect(r.docCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1M setDocLength round-trip (packed Uint32Array sidecar)
+// ---------------------------------------------------------------------------
+
+describe("SegmentWriter — 1M sidecar round-trip", () => {
+  let dir: string;
+  let backend: FsBackend;
+
+  beforeEach(async () => {
+    dir = await makeTmpDir();
+    backend = new FsBackend(dir);
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("1M setDocLength entries survive a write+open round-trip", { timeout: 60000 }, async () => {
+    const N = 1_000_000;
+    const stream = await backend.createWriteStream("seg-1m.seg");
+    const w = new SegmentWriter(stream);
+    for (let i = 0; i < N; i++) w.setDocLength(i, (i % 200) + 1);
+    await w.finish();
+
+    const r = await SegmentReader.open("seg-1m.seg", backend);
+    expect(r.docCount).toBe(N);
+
+    // Spot-check 100 random docIds.
+    let seed = 0xcafebabe;
+    for (let c = 0; c < 100; c++) {
+      seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+      const docId = (seed >>> 0) % N;
+      expect(r.docLen(docId)).toBe((docId % 200) + 1);
+    }
+  });
 });
