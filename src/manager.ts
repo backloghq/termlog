@@ -21,6 +21,7 @@
  */
 
 import { SegmentWriter, SegmentReader } from "./segment.js";
+import { MinHeap } from "./heap.js";
 import type { StorageBackend } from "./storage.js";
 import type { DictEntry } from "./term-dict.js";
 
@@ -330,56 +331,99 @@ export class SegmentManager {
       for (const id of seg.tombstones) tombstoneUnion.add(id);
     }
 
-    // --- Step 1: collect all terms + postings across snapshot segments ---
-    // termPostings: term → Map<oldDocId, tf>  (tf accumulates across segments for same doc)
-    // Tombstoned docIds are skipped — compaction physically removes them.
-    const termPostings = new Map<string, Map<number, number>>();
-
+    // --- Step 1: build docId renumber map (O(unique surviving docs)) ---
+    // First pass: collect surviving docIds from all posting lists (skip tombstoned).
+    const survivingOldDocIds = new Set<number>();
     for (const seg of toMerge) {
       for (const entry of seg.terms() as Generator<DictEntry>) {
-        const { docIds, tfs } = seg.decodePostings(entry.term);
-        let postMap = termPostings.get(entry.term);
-        if (!postMap) { postMap = new Map(); termPostings.set(entry.term, postMap); }
-        for (let i = 0; i < docIds.length; i++) {
-          if (!tombstoneUnion.has(docIds[i])) {
-            postMap.set(docIds[i], (postMap.get(docIds[i]) ?? 0) + tfs[i]);
-          }
+        const { docIds } = seg.decodePostings(entry.term);
+        for (const id of docIds) {
+          if (!tombstoneUnion.has(id)) survivingOldDocIds.add(id);
         }
       }
     }
+    const oldIds = [...survivingOldDocIds].sort((a, b) => a - b);
 
-    // Gather all unique old doc IDs (after tombstone filtering) and sort them.
-    const allOldDocIds = new Set<number>();
-    for (const postMap of termPostings.values()) {
-      for (const docId of postMap.keys()) allOldDocIds.add(docId);
-    }
-    const oldIds = [...allOldDocIds].sort((a, b) => a - b);
-
-    // --- Step 2: re-number doc IDs to a dense range ---
+    // Re-number to dense range.
     const remapOld2New = new Map<number, number>();
     oldIds.forEach((oldId, newId) => remapOld2New.set(oldId, newId));
 
-    // Carry doc lengths forward (each old docId lives in exactly one segment).
+    // Carry doc lengths forward.
     const docLenMap = new Map<number, number>();
     for (const oldId of oldIds) {
-      let len = 0;
       for (const seg of toMerge) {
         const l = seg.docLen(oldId);
-        if (l > 0) { len = l; break; }
+        if (l > 0) { docLenMap.set(remapOld2New.get(oldId)!, l); break; }
       }
-      docLenMap.set(remapOld2New.get(oldId)!, len);
     }
 
-    // --- Step 3: write merged segment ---
+    // --- Step 2: streaming k-way merge of term iterators into SegmentWriter ---
+    // Uses a min-heap keyed by (term, segIndex) — O(K) heap entries at any time,
+    // O(largest single posting list) for the per-term accumulator.
     const mergedId = `seg-${String(this.nextSegCounter).padStart(6, "0")}`;
     this.nextSegCounter++;
 
     const writer = new SegmentWriter();
-    for (const [term, postMap] of termPostings) {
-      for (const [oldId, tf] of postMap) {
-        writer.addPosting(term, remapOld2New.get(oldId)!, tf);
+
+    interface HeapEntry {
+      segIndex: number;
+      termIter: Generator<DictEntry>;
+      currentTerm: string;
+    }
+
+    const heap = new MinHeap<HeapEntry>((a, b) => {
+      if (a.currentTerm < b.currentTerm) return -1;
+      if (a.currentTerm > b.currentTerm) return 1;
+      return a.segIndex - b.segIndex;
+    });
+
+    for (let si = 0; si < toMerge.length; si++) {
+      const termIter = toMerge[si].terms() as Generator<DictEntry>;
+      const first = termIter.next();
+      if (!first.done) {
+        heap.push({ segIndex: si, termIter, currentTerm: first.value.term });
       }
     }
+
+    let prevTerm: string | null = null;
+    // Accumulator for the current term's postings: Map<newDocId, tf>
+    let termAccum = new Map<number, number>();
+
+    const flushTerm = () => {
+      if (prevTerm === null || termAccum.size === 0) return;
+      for (const [newId, tf] of termAccum) {
+        writer.addPosting(prevTerm, newId, tf);
+      }
+    };
+
+    while (heap.size > 0) {
+      const top = heap.peek()!;
+
+      if (top.currentTerm !== prevTerm) {
+        flushTerm();
+        termAccum = new Map();
+        prevTerm = top.currentTerm;
+      }
+
+      // Drain all heap entries at this term.
+      while (heap.size > 0 && heap.peek()!.currentTerm === prevTerm) {
+        const entry = heap.pop()!;
+        const { docIds, tfs } = toMerge[entry.segIndex].decodePostings(prevTerm);
+        for (let i = 0; i < docIds.length; i++) {
+          const newId = remapOld2New.get(docIds[i]);
+          if (newId !== undefined) {
+            termAccum.set(newId, (termAccum.get(newId) ?? 0) + tfs[i]);
+          }
+        }
+        const next = entry.termIter.next();
+        if (!next.done) {
+          entry.currentTerm = next.value.term;
+          heap.push(entry);
+        }
+      }
+    }
+    flushTerm();
+
     for (const [newId, len] of docLenMap) {
       writer.setDocLength(newId, len);
     }
