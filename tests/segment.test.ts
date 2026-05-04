@@ -21,8 +21,8 @@ async function buildAndFlush(id: string, backend: FsBackend): Promise<void> {
   await w.writeTerm("programming", [0],    [1]);
   await w.writeTerm("rust",        [0, 2], [2, 1]);
   await w.writeTerm("safety",      [2],    [1]);
-  await w.writeTerm("typescript",  [1],    [3]);
   await w.writeTerm("types",       [1, 2], [2, 1]);
+  await w.writeTerm("typescript",  [1],    [3]);
   await w.finish();
 }
 

@@ -82,6 +82,7 @@ export class SegmentWriter {
   private sidecarCount = 0;
 
   private tombstonesArr: number[] = [];
+  private lastTerm: string | undefined = undefined;
 
   constructor(stream: WriteStream) {
     this.stream = stream;
@@ -89,9 +90,15 @@ export class SegmentWriter {
 
   /**
    * Write one term's postings. docIds MUST be in ascending order.
-   * Terms MUST be called in lex-sorted order.
+   * Terms MUST be called in lex-sorted order (strictly ascending — no duplicates).
    */
   async writeTerm(term: string, sortedDocIds: number[], sortedTfs: number[]): Promise<void> {
+    if (this.lastTerm !== undefined && term <= this.lastTerm) {
+      throw new RangeError(
+        `writeTerm: terms must be in strictly ascending lex order; got "${term}" after "${this.lastTerm}"`,
+      );
+    }
+    this.lastTerm = term;
     const buf = encodePostings(sortedDocIds, sortedTfs);
     this.postingsCrc.update(buf);
     await this.stream.write(buf);
