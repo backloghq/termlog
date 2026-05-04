@@ -12,6 +12,12 @@ export interface StorageBackend {
   writeBlob(path: string, data: Buffer): Promise<void>;
   listBlobs(prefix: string): Promise<string[]>;
   deleteBlob(path: string): Promise<void>;
+  /**
+   * Append `data` to the end of `path`, creating it if absent.
+   * Optional — callers fall back to read-modify-writeBlob on backends that omit this.
+   * Implementations must fsync before returning so data survives a crash.
+   */
+  appendBlob?(path: string, data: Buffer): Promise<void>;
   /** Hint for concurrency caps — true when backed by the local filesystem. */
   isLocalFs?(): boolean;
 }
@@ -85,6 +91,22 @@ export class FsBackend implements StorageBackend {
       await unlink(this.abs(path));
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+
+  /**
+   * Append `data` to `path` using O_APPEND (atomic at the kernel level for
+   * writes <= PIPE_BUF on the same filesystem), then fsync for crash durability.
+   */
+  async appendBlob(path: string, data: Buffer): Promise<void> {
+    const dest = this.abs(path);
+    await mkdir(dirname(dest), { recursive: true });
+    const fh = await open(dest, "a");
+    try {
+      await fh.write(data);
+      await fh.sync();
+    } finally {
+      await fh.close();
     }
   }
 }

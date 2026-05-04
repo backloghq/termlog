@@ -94,6 +94,40 @@ describe("FsBackend", () => {
   });
 });
 
+describe("FsBackend.appendBlob", () => {
+  let dir: string;
+  let backend: FsBackend;
+
+  beforeEach(async () => {
+    dir = await makeTmpDir();
+    backend = new FsBackend(dir);
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("creates file and appends data", async () => {
+    await backend.appendBlob("log.txt", Buffer.from("line1\n"));
+    await backend.appendBlob("log.txt", Buffer.from("line2\n"));
+    const content = (await backend.readBlob("log.txt")).toString();
+    expect(content).toBe("line1\nline2\n");
+  });
+
+  it("appends to existing file without truncating", async () => {
+    await backend.writeBlob("existing.txt", Buffer.from("start\n"));
+    await backend.appendBlob("existing.txt", Buffer.from("appended\n"));
+    const content = (await backend.readBlob("existing.txt")).toString();
+    expect(content).toBe("start\nappended\n");
+  });
+
+  it("creates file if it does not exist", async () => {
+    await backend.appendBlob("new.txt", Buffer.from("hello"));
+    const content = (await backend.readBlob("new.txt")).toString();
+    expect(content).toBe("hello");
+  });
+});
+
 describe("StorageBackend interface compatibility", () => {
   it("FsBackend satisfies the StorageBackend interface", () => {
     const dir2 = tmpdir();

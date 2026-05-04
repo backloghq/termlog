@@ -184,15 +184,21 @@ export class TermLog {
   /** Append pending deltas to docids.log (called by onBeforeManifest — O(delta) not O(N)). */
   private async saveDocIds(): Promise<void> {
     if (this.pendingLog.length === 0) return;
-    const lines = this.pendingLog.join("\n") + "\n";
-    // Read existing log and append; writeBlob is atomic but full-replace, so we concat.
-    let existing = "";
-    try {
-      existing = (await this.backend.readBlob(DOCIDS_LOG)).toString("utf8");
-    } catch {
-      // No log yet — start fresh.
+    const chunk = Buffer.from(this.pendingLog.join("\n") + "\n", "utf8");
+    if (this.backend.appendBlob) {
+      // True append — O(delta), crash-safe via backend fsync.
+      await this.backend.appendBlob(DOCIDS_LOG, chunk);
+    } else {
+      // Fallback for backends without appendBlob (e.g. S3 snapshot mode):
+      // read-concat-write. Still O(delta) per call but not atomic at the OS level.
+      let existing = "";
+      try {
+        existing = (await this.backend.readBlob(DOCIDS_LOG)).toString("utf8");
+      } catch {
+        // No log yet — start fresh.
+      }
+      await this.backend.writeBlob(DOCIDS_LOG, Buffer.from(existing + chunk.toString("utf8"), "utf8"));
     }
-    await this.backend.writeBlob(DOCIDS_LOG, Buffer.from(existing + lines, "utf8"));
     this.pendingLog.length = 0;
   }
 

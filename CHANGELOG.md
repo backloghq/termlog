@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Structured public fields on error classes: `ManifestCorruptionError.detail`, `MappingCorruptionError.detail`, `TokenizerMismatchError.persisted` / `.runtime`.
 - `ManifestVersionError` exported from `src/index.ts`.
 - NFD normalization test, remove-then-re-add same docId test, mid-compaction crash test, `VERSION` export assertion.
+- `StorageBackend.appendBlob?(path, data)` optional method — crash-safe O(1) append for backends that support it; callers fall back to read-modify-write automatically.
+- `FsBackend.appendBlob` — opens `O_APPEND|O_CREAT`, writes chunk, fsyncs; true kernel-level append for `docids.log` on local FS.
+- `S3StorageAdapter` in new sub-export `@backloghq/termlog/s3` — wraps any S3-compatible client (AWS SDK v3, R2, MinIO) via injected command constructors; zero hard SDK dependency. `appendBlob` intentionally absent (S3 has no native append; docids falls back to snapshot mode).
+- `termlog/s3` entry added to `package.json` exports map.
 - `TermLog.add()` update regression test: verifies in-place update produces no double-counted results and old content is gone.
 - `TermLog` facade-level write mutex (`serialize<R>()` promise chain) serializing `add/remove/close` — prevents TOCTOU races on `strToNum`/`numToStr` mapping under concurrent callers.
 
