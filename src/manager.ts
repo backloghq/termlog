@@ -624,7 +624,6 @@ export class SegmentManager {
         }
       }
       await flushTerm();
-      toMergeReaders.length = 0;
       await writer.finish();
     } catch (err) {
       await stream.abort().catch(() => undefined);
