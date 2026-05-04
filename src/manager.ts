@@ -402,9 +402,9 @@ export class SegmentManager {
       throw err;
     }
 
-    // Update totals.
-    this.totalDocs += this.buffer.length;
-    this.totalLen += segTotalLen;
+    // Open the new reader BEFORE committing the manifest so that if SegmentReader.open
+    // throws the manifest is not yet committed and in-memory state is still consistent.
+    const newReader = await SegmentReader.open(`${segId}.seg`, this.backend);
 
     const newEntry: ManifestSegmentEntry = {
       id: segId,
@@ -422,7 +422,9 @@ export class SegmentManager {
     // ahead of the manifest (harmless — extra entries); never behind it.
     if (this.onBeforeManifest) await this.onBeforeManifest();
 
-    // Atomically update manifest.
+    // Atomically commit: manifest first, then update in-memory state.
+    this.totalDocs += newEntry.docCount;
+    this.totalLen += segTotalLen;
     this.generation++;
     const newManifestSegments = [...this.manifestSegments, newEntry];
     await this.writeManifest({
@@ -434,9 +436,6 @@ export class SegmentManager {
       totalLen: this.totalLen,
     });
     this.manifestSegments = newManifestSegments;
-
-    // Extend reader snapshot immutably.
-    const newReader = await SegmentReader.open(`${segId}.seg`, this.backend);
     this.readerSnapshot = [...this.readerSnapshot, newReader];
   }
 
@@ -633,6 +632,10 @@ export class SegmentManager {
     }
 
     // --- Step 3: atomic manifest swap ---
+    // Open merged reader BEFORE committing the manifest so that if SegmentReader.open
+    // throws the manifest is not yet committed and in-memory state stays consistent.
+    const mergedReader = await SegmentReader.open(`${mergedId}.seg`, this.backend);
+
     const mergedEntry: ManifestSegmentEntry = {
       id: mergedId,
       docCount: survivingDocs.size,
@@ -646,8 +649,6 @@ export class SegmentManager {
 
     const newTotalDocs = newSegmentList.reduce((s, e) => s + e.docCount, 0);
     const newTotalLen = newSegmentList.reduce((s, e) => s + e.totalLen, 0);
-    this.totalDocs = newTotalDocs;
-    this.totalLen = newTotalLen;
 
     this.generation++;
     await this.writeManifest({
@@ -655,13 +656,14 @@ export class SegmentManager {
       generation: this.generation,
       segments: newSegmentList,
       tokenizer: this.tokenizerConfig,
-      totalDocs: this.totalDocs,
-      totalLen: this.totalLen,
+      totalDocs: newTotalDocs,
+      totalLen: newTotalLen,
     });
-    this.manifestSegments = newSegmentList;
 
-    // Rebuild reader snapshot: merged reader replaces merged segments; others kept in order.
-    const mergedReader = await SegmentReader.open(`${mergedId}.seg`, this.backend);
+    // Atomically swap in-memory state after manifest commit.
+    this.totalDocs = newTotalDocs;
+    this.totalLen = newTotalLen;
+    this.manifestSegments = newSegmentList;
     const survivingReaders = this.readerSnapshot.filter((_, i) => !toMergeIndices.has(i));
     this.readerSnapshot = [mergedReader, ...survivingReaders];
 
