@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [0.1.0] - 2026-05-04
 
+### Changed
+- `SegmentWriter` is now a streaming writer: `writeTerm(term, sortedDocIds, sortedTfs)` encodes and writes postings immediately via `WriteStream` — no full postings region buffered in memory. Replaces the accumulate-then-flush `addPosting`/`flush` API.
+- `StorageBackend` interface gains `createWriteStream(path)` returning a `WriteStream` (`write`/`end`/`abort`). `FsBackend` implements it with a `.tmp` sidecar + fsync + atomic rename. `S3StorageAdapter` implements it via the S3 multipart upload protocol (5 MiB part minimum).
+- `SegmentWriter` doc-length sidecar now uses a packed interleaved `Uint32Array` (`[docId, len, ...]`, 1.5× growth) instead of `Map<number, number>` — 8 bytes/doc vs ~64–80, saving ~56 MB at 1M docs.
+
+### Performance
+- 1M-doc tiered cascade now peaks under 800 MB RSS (down from 1.05 GB). Source `postingsRegion` buffers from merged segments are released (`toMergeReaders.length = 0`) before `writer.finish()`, allowing GC to reclaim them before the merged segment is committed. `tombstonedMergedDocs` (intersection of tombstones and merged docs) replaces the full `mergedDocIds` Set. Running `mergedTotalLen` accumulator replaces `[...survivingDocs.values()].reduce()` array materialization.
+
 ### Added
 - `S3StorageAdapter` at `@backloghq/termlog/s3` sub-export — wraps any S3-compatible client for S3-backed indexes. Constructor warns when `prefix` is empty (would scope `recoverOrphans` to the entire bucket).
 - `readonly SegmentReader[]` return type on `segments()` — signals callers must not mutate the snapshot.
