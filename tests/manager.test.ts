@@ -228,6 +228,52 @@ describe("manifest-before-reader-open invariant", () => {
     expect(mgr.commitGeneration()).toBe(4); // 3 prior flushes + 1 flush for doc 3
     expect(mgr.indexTotalDocs).toBe(4);    // all 4 docs present
   });
+
+  it("flushLocked: writeManifest failure leaves all in-memory state unchanged", async () => {
+    const mgr = await SegmentManager.open({ backend });
+    await mgr.add(0, [{ term: "a", tf: 1 }]);
+    await mgr.add(1, [{ term: "b", tf: 1 }]);
+    await mgr.flush();
+
+    // Add two more docs to the buffer (not yet flushed).
+    await mgr.add(2, [{ term: "c", tf: 2 }]);
+    await mgr.add(3, [{ term: "d", tf: 3 }]);
+
+    const preTotalDocs = mgr.indexTotalDocs;
+    const preTotalLen = mgr.indexTotalLen;
+    const preGen = mgr.commitGeneration();
+    const preSegs = mgr.segments().length;
+    const preBuffered = mgr.bufferedCount();
+
+    // Stub writeBlob to throw on manifest write.
+    const realWrite = backend.writeBlob.bind(backend);
+    backend.writeBlob = async (path: string, data: Buffer) => {
+      if (path === "manifest.json") throw new Error("simulated manifest write failure");
+      return realWrite(path, data);
+    };
+
+    await expect(mgr.flush()).rejects.toThrow("simulated manifest write failure");
+
+    // ALL state must be unchanged — no inflation even after repeated failures.
+    expect(mgr.indexTotalDocs).toBe(preTotalDocs);
+    expect(mgr.indexTotalLen).toBe(preTotalLen);
+    expect(mgr.commitGeneration()).toBe(preGen);
+    expect(mgr.segments().length).toBe(preSegs);
+    expect(mgr.bufferedCount()).toBe(preBuffered);
+
+    // Verify a second failed flush also does not accumulate inflation.
+    await expect(mgr.flush()).rejects.toThrow("simulated manifest write failure");
+    expect(mgr.indexTotalDocs).toBe(preTotalDocs);
+    expect(mgr.commitGeneration()).toBe(preGen);
+
+    // Restore and verify a successful flush sees the correct final state.
+    backend.writeBlob = realWrite;
+    await mgr.flush();
+    expect(mgr.indexTotalDocs).toBe(preTotalDocs + preBuffered);
+    expect(mgr.commitGeneration()).toBe(preGen + 1);
+    expect(mgr.segments().length).toBe(preSegs + 1);
+    expect(mgr.bufferedCount()).toBe(0);
+  });
 });
 
 describe("SegmentManager — multiple docs per segment", () => {

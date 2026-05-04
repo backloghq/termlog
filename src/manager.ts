@@ -413,30 +413,34 @@ export class SegmentManager {
       tier: 0,
     };
 
-    // Clear buffer before manifest update so a crash between flush and manifest
-    // update leaves an orphaned .seg (safe — manifest is the source of truth).
-    this.buffer = [];
-
     // Persist any side-data (e.g. docId mapping) before the manifest commit so
     // the two are always consistent: if the process crashes here, the mapping is
     // ahead of the manifest (harmless — extra entries); never behind it.
     if (this.onBeforeManifest) await this.onBeforeManifest();
 
-    // Atomically commit: manifest first, then update in-memory state.
-    this.totalDocs += newEntry.docCount;
-    this.totalLen += segTotalLen;
-    this.generation++;
+    // Build new state into locals, then commit atomically: writeManifest first,
+    // then update all in-memory fields together. If writeManifest throws, nothing
+    // is mutated and the live process stays consistent (totals/generation/snapshot
+    // all unchanged; the buffer is preserved so a retry can re-flush).
+    const newGeneration = this.generation + 1;
+    const newTotalDocs = this.totalDocs + newEntry.docCount;
+    const newTotalLen = this.totalLen + segTotalLen;
     const newManifestSegments = [...this.manifestSegments, newEntry];
     await this.writeManifest({
       version: MANIFEST_VERSION,
-      generation: this.generation,
+      generation: newGeneration,
       segments: newManifestSegments,
       tokenizer: this.tokenizerConfig,
-      totalDocs: this.totalDocs,
-      totalLen: this.totalLen,
+      totalDocs: newTotalDocs,
+      totalLen: newTotalLen,
     });
+    // writeManifest succeeded — commit all in-memory state at once.
+    this.generation = newGeneration;
+    this.totalDocs = newTotalDocs;
+    this.totalLen = newTotalLen;
     this.manifestSegments = newManifestSegments;
     this.readerSnapshot = [...this.readerSnapshot, newReader];
+    this.buffer = [];
   }
 
   /**
