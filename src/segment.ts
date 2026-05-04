@@ -195,7 +195,12 @@ interface SegmentFooter {
 export class SegmentReader {
   private readonly postingsRegion: Buffer;
   private readonly dict: TermDict;
-  private readonly docLenMap: Map<number, number>;
+  /**
+   * Interleaved sorted array: [docId0, len0, docId1, len1, ...].
+   * Sorted by docId ascending. Binary search via docLen().
+   * Replaces Map<number,number> to avoid 1M+ slot heap allocation for large merged segments.
+   */
+  private readonly docLenArr: Uint32Array;
   /** Sorted tombstone docIds — docs that have been removed and belong to prior segments. */
   readonly tombstones: Uint32Array;
   readonly docCount: number;
@@ -204,14 +209,14 @@ export class SegmentReader {
   private constructor(
     postingsRegion: Buffer,
     dict: TermDict,
-    docLenMap: Map<number, number>,
+    docLenArr: Uint32Array,
     tombstones: Uint32Array,
     docCount: number,
     termCount: number,
   ) {
     this.postingsRegion = postingsRegion;
     this.dict = dict;
-    this.docLenMap = docLenMap;
+    this.docLenArr = docLenArr;
     this.tombstones = tombstones;
     this.docCount = docCount;
     this.termCount = termCount;
@@ -288,13 +293,13 @@ export class SegmentReader {
     // Deserialize dict
     const dict = TermDict.deserialize(dictBuf);
 
-    // Deserialize doc-length sidecar
-    const docLenMap = new Map<number, number>();
+    // Deserialize doc-length sidecar into interleaved Uint32Array [docId, len, ...]
+    // sorted by docId (the on-disk format already stores them sorted).
     const storedDocCount = sidecarBuf.readUInt32LE(0);
+    const docLenArr = new Uint32Array(storedDocCount * 2);
     for (let i = 0; i < storedDocCount; i++) {
-      const docId = sidecarBuf.readUInt32LE(4 + i * 8);
-      const len   = sidecarBuf.readUInt32LE(4 + i * 8 + 4);
-      docLenMap.set(docId, len);
+      docLenArr[i * 2]     = sidecarBuf.readUInt32LE(4 + i * 8);
+      docLenArr[i * 2 + 1] = sidecarBuf.readUInt32LE(4 + i * 8 + 4);
     }
 
     // Deserialize tombstones
@@ -304,7 +309,7 @@ export class SegmentReader {
       tombstones[i] = tombstonesBuf.readUInt32LE(4 + i * 4);
     }
 
-    return new SegmentReader(postingsRegion, dict, docLenMap, tombstones, footer.docCount, footer.termCount);
+    return new SegmentReader(postingsRegion, dict, docLenArr, tombstones, footer.docCount, footer.termCount);
   }
 
   /** Returns true if docId is tombstoned in this segment (binary search). */
@@ -327,10 +332,10 @@ export class SegmentReader {
   }
 
   /** Lazy posting iterator for a term. Returns an empty iterator if term not found. */
-  postings(term: string): Iterator<Posting> {
+  postings(term: string): Iterator<Posting, undefined> {
     const entry = this.dict.lookup(term);
     if (!entry) {
-      return { next() { return { done: true, value: undefined as unknown as Posting }; } };
+      return { next(): IteratorReturnResult<undefined> { return { done: true, value: undefined }; } };
     }
     const slice = this.postingsRegion.subarray(entry.postingsOffset, entry.postingsOffset + entry.postingsLength);
     return postingIterator(slice);
@@ -344,14 +349,25 @@ export class SegmentReader {
     return decodePostings(slice);
   }
 
-  /** Return the stored document length for BM25 normalization. */
+  /** Return the stored document length for BM25 normalization (binary search). */
   docLen(docId: number): number {
-    return this.docLenMap.get(docId) ?? 0;
+    let lo = 0;
+    let hi = (this.docLenArr.length >>> 1) - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      const id = this.docLenArr[mid * 2];
+      if (id === docId) return this.docLenArr[mid * 2 + 1];
+      if (id < docId) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return 0;
   }
 
   /** Iterate all (docId, length) pairs in this segment's sidecar — for compaction. */
-  docLenEntries(): IterableIterator<[number, number]> {
-    return this.docLenMap.entries();
+  *docLenEntries(): Generator<[number, number]> {
+    for (let i = 0; i < this.docLenArr.length; i += 2) {
+      yield [this.docLenArr[i], this.docLenArr[i + 1]];
+    }
   }
 
   /** All terms in sorted order (for compaction merging). */

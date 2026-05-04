@@ -290,9 +290,10 @@ export class TermLog {
     await this.mgr.flush();
   }
 
-  /** Merge segments. */
+  /** Merge segments. Snapshots docIds after compact to bound log growth. */
   async compact(): Promise<void> {
     await this.mgr.compact();
+    await this.snapshotDocIds();
   }
 
   /** Close: flush pending writes and release the advisory lock. */

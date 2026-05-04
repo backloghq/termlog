@@ -120,10 +120,18 @@ const tl = await TermLog.open({
 });
 ```
 
+## DocId journal growth
+
+`saveDocIds` appends delta entries to `docids.log` on every flush. `snapshotDocIds` collapses the log into `docids.snap` and deletes the log. Snapshots are triggered:
+
+1. On `close()` — consolidates in-memory-only removes.
+2. On every `compact()` — bounds growth for long-running servers; the compaction already touches all segments so the snapshot cost is negligible.
+
 ## Crash recovery
 
 - Manifest is the source of truth. On open, list segments referenced by the manifest; ignore orphaned segment files.
 - A partial segment write (process killed mid-flush) leaves a `.seg.tmp` file that's not yet referenced — cleaned up on open.
+- A missing segment file referenced by the manifest throws `SegmentCorruptionError(region="footer")` — not a raw ENOENT — so callers can catch it by type.
 - Manifest update is atomic via rename.
 - CRC32 footers detect on-disk corruption; corrupted segments fail loudly on first read.
 

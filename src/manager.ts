@@ -37,6 +37,14 @@ export interface ManifestSegmentEntry {
   tier: number;
 }
 
+/** Raw on-disk segment entry — `tier` is optional because v1 manifests omit it. */
+interface RawManifestEntry {
+  id: string;
+  docCount: number;
+  totalLen: number;
+  tier?: number;
+}
+
 export interface TokenizerConfig {
   kind: string;
   minLen: number;
@@ -45,7 +53,7 @@ export interface TokenizerConfig {
 interface Manifest {
   version: number;
   generation: number;
-  segments: ManifestSegmentEntry[];
+  segments: RawManifestEntry[];
   tokenizer: TokenizerConfig;
   totalDocs: number;
   totalLen: number;
@@ -61,10 +69,8 @@ interface BufferedDoc {
 const MANIFEST_VERSION = 2;
 const MANIFEST_MIN_SUPPORTED = 1;
 const MANIFEST_FILE = "manifest.json";
-const MANIFEST_TMP = "manifest.tmp";
 const LOCK_FILE = ".lock";
 export const DEFAULT_FLUSH_THRESHOLD = 1000;
-const DEFAULT_MERGE_THRESHOLD = 8;
 const DEFAULT_FANOUT = 4;
 
 /** Thrown when manifest.json exists but cannot be parsed. */
@@ -101,14 +107,13 @@ export interface SegmentManagerOpts {
   /** How many buffered docs trigger an automatic flush. Default: 1000. */
   flushThreshold?: number;
   /**
-   * How many segments of the same tier trigger an automatic tiered compaction merge.
-   * Default: 8. Kept for backward compatibility — when `fanout` is not set this value
-   * is used as the fanout.
+   * Backward compat alias for `fanout`. Ignored when `fanout` is set.
+   * Kept so existing callers that pass `mergeThreshold` continue to work.
    */
   mergeThreshold?: number;
   /**
    * How many same-tier segments trigger a tier merge (size-tiered compaction).
-   * When set, takes precedence over `mergeThreshold`. Default: 4.
+   * Default: 4.
    */
   fanout?: number;
   tokenizer?: TokenizerConfig;
@@ -124,7 +129,6 @@ export interface SegmentManagerOpts {
 export class SegmentManager {
   private readonly backend: StorageBackend;
   private readonly flushThreshold: number;
-  private readonly mergeThreshold: number;
   private readonly tieredFanout: number;
   private readonly tokenizerConfig: TokenizerConfig;
   private readonly onBeforeManifest: (() => Promise<void>) | undefined;
@@ -162,14 +166,12 @@ export class SegmentManager {
   private constructor(
     backend: StorageBackend,
     flushThreshold: number,
-    mergeThreshold: number,
     tieredFanout: number,
     tokenizerConfig: TokenizerConfig,
     onBeforeManifest?: () => Promise<void>,
   ) {
     this.backend = backend;
     this.flushThreshold = flushThreshold;
-    this.mergeThreshold = mergeThreshold;
     this.tieredFanout = tieredFanout;
     this.tokenizerConfig = tokenizerConfig;
     this.onBeforeManifest = onBeforeManifest;
@@ -180,7 +182,6 @@ export class SegmentManager {
     const mgr = new SegmentManager(
       opts.backend,
       opts.flushThreshold ?? DEFAULT_FLUSH_THRESHOLD,
-      opts.mergeThreshold ?? DEFAULT_MERGE_THRESHOLD,
       effectiveFanout,
       opts.tokenizer ?? { kind: "unicode", minLen: 1 },
       opts.onBeforeManifest,
@@ -243,11 +244,9 @@ export class SegmentManager {
   }
 
   private async loadManifest(): Promise<void> {
-    // Scenario 3: stale *.tmp from interrupted FsBackend rename — delete any
-    // manifest-related temp files. manifest.json is either absent or fully
-    // written (FsBackend.writeBlob is atomic: writes to <path>.tmp then renames).
-    try { await this.backend.deleteBlob(MANIFEST_TMP); } catch { /* not present */ }
-    try { await this.backend.deleteBlob(`${MANIFEST_FILE}.tmp`); } catch { /* not present */ }
+    // Temp-file cleanup is handled by recoverOrphans() (called after this method).
+    // manifest.json is either absent or fully written — FsBackend.writeBlob is
+    // atomic (nonce-suffix tmp then rename), so no partial manifest.json exists.
 
     let raw: Buffer;
     try {
@@ -278,7 +277,7 @@ export class SegmentManager {
     // v1 → v2 upgrade: assign tier=0 to all segments (they were never tiered).
     this.manifestSegments = manifest.segments.map((e) => ({
       ...e,
-      tier: (e as ManifestSegmentEntry).tier ?? 0,
+      tier: e.tier ?? 0,
     }));
     this.totalDocs = manifest.totalDocs;
     this.totalLen = manifest.totalLen;
@@ -667,8 +666,11 @@ export class SegmentManager {
    * Return an immutable snapshot of the current segment readers.
    * Callers may hold this snapshot across a concurrent flush or compaction —
    * the snapshot is unaffected (old readers hold their own Buffer references).
+   *
+   * Do NOT mutate the returned array. It is the live readerSnapshot reference;
+   * mutations would corrupt internal state. Treat it as readonly.
    */
-  segments(): SegmentReader[] {
+  segments(): readonly SegmentReader[] {
     return this.readerSnapshot;
   }
 

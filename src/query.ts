@@ -91,7 +91,7 @@ export class SegmentPostingIter {
 // ---------------------------------------------------------------------------
 
 /** Build the union of all tombstone sets across segments for O(1) lookup. */
-export function buildTombstoneSet(segments: SegmentReader[]): Set<number> {
+export function buildTombstoneSet(segments: readonly SegmentReader[]): Set<number> {
   const set = new Set<number>();
   for (const seg of segments) {
     for (const id of seg.tombstones) set.add(id);
@@ -122,7 +122,7 @@ export class MultiSegmentIter {
   /** All iters, indexed by segIndex — needed for seek(). */
   private readonly iters: SegmentPostingIter[];
 
-  constructor(term: string, segments: SegmentReader[], tombstones?: Set<number>) {
+  constructor(term: string, segments: readonly SegmentReader[], tombstones?: Set<number>) {
     this.term = term;
     this.tombstones = tombstones ?? new Set();
     this.heap = new MinHeap<HeapSlot>((a, b) => a.docId - b.docId);
@@ -214,7 +214,7 @@ export class MultiSegmentIter {
  */
 export function* andQuery(
   terms: string[],
-  segments: SegmentReader[],
+  segments: readonly SegmentReader[],
 ): Generator<QueryPosting> {
   if (terms.length === 0 || segments.length === 0) return;
 
@@ -262,7 +262,7 @@ export function* andQuery(
  */
 export function* orQuery(
   terms: string[],
-  segments: SegmentReader[],
+  segments: readonly SegmentReader[],
 ): Generator<QueryPosting> {
   if (terms.length === 0 || segments.length === 0) return;
 

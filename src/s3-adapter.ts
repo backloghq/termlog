@@ -78,6 +78,13 @@ export class S3StorageAdapter implements StorageBackend {
     this.commands = opts.commands;
     this.bucket = opts.bucket;
     this.prefix = opts.prefix ?? "";
+    if (!this.prefix) {
+      console.warn(
+        "[S3StorageAdapter] WARNING: empty prefix on a shared bucket. " +
+        "recoverOrphans() will list and may delete unrelated seg-* objects. " +
+        "Set a non-empty prefix to scope this index to a safe key namespace.",
+      );
+    }
   }
 
   private key(path: string): string {

@@ -152,8 +152,7 @@ function buildReference(k1: number, b: number) {
     const results = Array.from(scores.entries()).map(([id, score]) => ({ id, score }));
     results.sort((a, z) => {
       if (z.score !== a.score) return z.score - a.score;
-      const sa = String(a.id); const sz = String(z.id);
-      return sa < sz ? -1 : sa > sz ? 1 : 0;
+      return a.id - z.id; // numeric tie-break, matches BM25Ranker
     });
     return results.slice(0, limit);
   }
@@ -270,14 +269,12 @@ describe("BM25Ranker — edge cases", () => {
     }
   });
 
-  it("ties broken by string-lexicographic docId asc (mirrors reference)", () => {
+  it("ties broken by numeric docId ascending", () => {
     const ranker = new BM25Ranker();
     const results = ranker.score(["fox"], [seg], N, totalLen);
     for (let i = 1; i < results.length; i++) {
       if (Math.abs(results[i].score - results[i - 1].score) < 1e-12) {
-        const sa = String(results[i - 1].docId);
-        const sb = String(results[i].docId);
-        expect(sa <= sb).toBe(true);
+        expect(results[i - 1].docId).toBeLessThanOrEqual(results[i].docId);
       }
     }
   });

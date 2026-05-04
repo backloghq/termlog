@@ -34,7 +34,7 @@ export function encodeVByte(n: number): Buffer {
 /** Decode a single VByte integer from buf starting at offset.
  *  Returns the decoded value and number of bytes consumed.
  *  Uses multiplication for high bits to avoid signed-integer overflow from JS
- *  bitwise ops (which are capped at signed 32-bit). Supports values up to 2^35-1. */
+ *  bitwise ops (which are capped at signed 32-bit). Supports values up to 2^49-1 (7 bytes). */
 export function decodeVByte(buf: Buffer, offset: number): { value: number; bytesRead: number } {
   let value = 0;
   let shift = 0;
@@ -116,7 +116,7 @@ export interface Posting {
  * Lazy posting iterator — decodes one entry at a time.
  * Suitable for the query path where early termination is common.
  */
-export function postingIterator(buf: Buffer): Iterator<Posting> {
+export function postingIterator(buf: Buffer): Iterator<Posting, undefined> {
   let offset = 0;
 
   const countResult = decodeVByte(buf, offset);
@@ -125,8 +125,8 @@ export function postingIterator(buf: Buffer): Iterator<Posting> {
   let prev = 0;
 
   return {
-    next(): IteratorResult<Posting> {
-      if (remaining === 0) return { done: true, value: undefined as unknown as Posting };
+    next(): IteratorResult<Posting, undefined> {
+      if (remaining === 0) return { done: true, value: undefined };
 
       const deltaResult = decodeVByte(buf, offset);
       offset += deltaResult.bytesRead;

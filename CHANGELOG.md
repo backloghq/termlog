@@ -7,13 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-04
+
 ### Added
+- `S3StorageAdapter` at `@backloghq/termlog/s3` sub-export — wraps any S3-compatible client for S3-backed indexes. Constructor warns loudly when `prefix` is empty (would scope `recoverOrphans` to the entire bucket).
+- `RawManifestEntry` internal interface — clean v1→v2 manifest upgrade without unsafe cast.
+- `readonly SegmentReader[]` return type on `segments()` — signals callers must not mutate the snapshot.
+- Source maps and declaration maps (`sourceMap: true`, `declarationMap: true` in tsconfig).
+- `"sideEffects": false` in package.json for bundler tree-shaking.
+
+### Changed
+- **Compaction no longer renumbers docIds** — original numIds are preserved through merge. Previously, densification broke `TermLog.numToStr` lookups (returned dense IDs that didn't match the original numId map) and broke tombstone matching for tier-1+ segments (tombstones store original numIds). The segment format already supported sparse uint32 docIds natively.
+- **Unresolved tombstones are carried forward** — when a merged segment holds a tombstone targeting a doc in an unmerged segment, the tombstone is now written to the merged output. Previously it was silently dropped, resurrecting the deleted doc in subsequent queries.
+- `compact()` now snapshots docIds after merge to bound `docids.log` growth on long-running servers.
+- Missing segment files referenced by the manifest now throw `SegmentCorruptionError(region="footer")` instead of a raw `ENOENT`.
+- `BM25Ranker` tie-break is now numeric (`a.docId - b.docId`) instead of `String(docId)` comparison — avoids two string allocations per heap comparison.
+- `SegmentReader` sidecar storage replaced from `Map<number,number>` to interleaved `Uint32Array[2N]` with binary search — avoids 1M+ Map slot heap for large merged segments.
+- `DEFAULT_MERGE_THRESHOLD = 8` constant removed — was set but never read (only `tieredFanout` is consulted). `mergeThreshold` option in `SegmentManagerOpts` is kept as a backward-compat alias for `fanout`.
+- `postingIterator` return type widened to `Iterator<Posting, undefined>` — removes `undefined as unknown as Posting` cast.
+- Dead manifest temp-file cleanup in `loadManifest` removed — `recoverOrphans()` already handles this.
+- `repository.url` in package.json fixed to `git+https://` form.
+
+### Fixed
+- `TermLog.search` returning wrong string docId after compaction (post-densification localId didn't match original numId in `numToStr`).
+- Tombstoned docs resurrecting after partial compaction when tombstone lived in a merged segment targeting a doc in an unmerged segment.
+- Incorrect comment in `codec.ts` claiming VByte supports "up to 2^35-1" — actual limit is 2^49-1 (7 bytes).
+- CHANGELOG entry referencing nonexistent `docIds.docCount` property — corrected to `SegmentReader.docCount`.
+
+### Added
+
+(Original [Unreleased] items from previous iteration follow:)
 - **Size-tiered compaction** (`#14614fcf`): segments now carry a `tier` field. After each flush, `chooseCompactionTargets()` picks the lowest tier with `>= fanout` segments and merges exactly `fanout` of them into a new segment at `tier + 1`. This cascades until no tier is eligible. Write amplification is `O(N log_{fanout} N)` — each doc is rewritten at most `log_4(256)=4` times for N=256 with the default fanout=4. Manual `compact()` merges everything into one segment (`maxTier + 1`), unchanged semantics for callers that call it explicitly.
 - `fanout` option on `SegmentManagerOpts` and `TermLogOptions` — configures the size-tiered compaction fanout (default 4). `mergeThreshold` is kept as a backward-compat alias.
 - `ManifestSegmentEntry.tier` field — per-segment compaction tier stored in the manifest.
 - Manifest v2 format adds `tier` to each segment entry. v1 manifests (no `tier`) are transparently upgraded on open: all segments assigned `tier: 0`. The first write after open emits a v2 manifest.
 - `ManifestVersionError` now validates `version <= MANIFEST_VERSION` (was `=== 1`); accepts both v1 and v2.
-- `docIds.docCount` property on `SegmentReader` used for per-segment base-offset computation during merge — prevents internal docId collisions when merging previously-merged segments.
+- `SegmentReader.docCount` property — number of docs in the segment's sidecar, used for per-segment offset computation during merge.
 - Tiered compaction test suite: cascade promotion (tier-0 → tier-1 → tier-2), all docs recoverable after multi-tier promotion, v1 manifest upgrade (tier=0 assigned, cascade fires correctly), manual `compact()` correctness and persistence across reopen, configurable fanout (fanout=2, fanout=8, mergeThreshold as fanout alias), write-amplification bound assertions (O(N log N) verified at N=256).
 - `QueryPosting.segIndex` — index of the segment owning each result docId, enabling O(1) docLen lookup in `BM25Ranker.score()`.
 - `MultiSegmentIter` rewritten to use `MinHeap<HeapSlot>` — `currentDocId` peek is O(1), seek rebuilds the heap in O(K log K) instead of O(K²).

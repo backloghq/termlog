@@ -88,7 +88,7 @@ export class BM25Ranker {
    */
   score(
     terms: string[],
-    segments: SegmentReader[],
+    segments: readonly SegmentReader[],
     N: number,
     totalLen: number,
     limit?: number,
@@ -119,9 +119,8 @@ export class BM25Ranker {
       // so we can evict it when a better candidate arrives.
       const heap = new MinHeap<ScoredDoc>((a, z) => {
         if (a.score !== z.score) return a.score - z.score;
-        // Same score: lex-larger docId is worse → put it at root (return negative).
-        const sa = String(a.docId); const sz = String(z.docId);
-        return sa > sz ? -1 : sa < sz ? 1 : 0;
+        // Same score: larger numId is worse → put at root (evicted first).
+        return z.docId - a.docId;
       });
 
       for (const { docId, tfs, segIndex } of queryIter) {
@@ -139,11 +138,9 @@ export class BM25Ranker {
           heap.push({ docId, score: docScore });
         } else {
           const worst = heap.peek()!;
-          // New entry is better than worst if: higher score, or same score + lex-smaller docId.
-          const sa = String(docId); const sw = String(worst.docId);
           const betterThanWorst =
             docScore > worst.score ||
-            (docScore === worst.score && sa < sw);
+            (docScore === worst.score && docId < worst.docId);
           if (betterThanWorst) {
             heap.pop();
             heap.push({ docId, score: docScore });
@@ -175,11 +172,10 @@ export class BM25Ranker {
 
     if (results.length === 0) return [];
 
-    // Sort: score desc, tie-break lex-asc on stringified docId (mirrors agentdb).
+    // Sort: score desc, tie-break by ascending numId.
     results.sort((a, z) => {
       if (z.score !== a.score) return z.score - a.score;
-      const sa = String(a.docId); const sz = String(z.docId);
-      return sa < sz ? -1 : sa > sz ? 1 : 0;
+      return a.docId - z.docId;
     });
     return results;
   }
