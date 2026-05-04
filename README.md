@@ -2,7 +2,7 @@
 
 Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.
 
-**Status:** scaffold. See `DESIGN.md` and the project backlog for the build-out plan.
+**Status:** v0.1.0 — log-structured FTS, 167 tests. Segment-based posting lists, LSM compaction, BM25 ranking parity with agentdb TextIndex, crash recovery, reader snapshot isolation, FsBackend nonce-safe concurrent writes.
 
 ## Why
 
