@@ -2,7 +2,7 @@ export const VERSION = "0.1.0";
 
 // TermLog facade — primary user-facing API
 export type { TermLogOptions } from "./termlog.js";
-export { TermLog, MappingCorruptionError } from "./termlog.js";
+export { TermLog, MappingCorruptionError, TokenizerMismatchError } from "./termlog.js";
 
 // Tokenizer
 export type { Tokenizer } from "./tokenizer.js";

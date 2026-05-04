@@ -4,6 +4,8 @@
  */
 
 export interface Tokenizer {
+  /** Stable identifier persisted in the manifest. */
+  readonly kind: string;
   tokenize(text: string): string[];
 }
 
@@ -13,6 +15,7 @@ export interface Tokenizer {
  * tokenization so BM25 scores are comparable across both implementations.
  */
 export class UnicodeTokenizer implements Tokenizer {
+  readonly kind = "unicode" as const;
   private readonly minLen: number;
 
   constructor(minLen = 1) {

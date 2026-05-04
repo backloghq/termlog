@@ -106,6 +106,10 @@ export class SegmentManager {
   private buffer: BufferedDoc[] = [];
   private totalDocs = 0;
   private totalLen = 0;
+  /** True when an existing manifest.json was loaded (not a fresh index). */
+  private _manifestLoaded = false;
+  /** Tokenizer kind recorded in the manifest (null for fresh indexes). */
+  private _persistedTokenizerKind: string | null = null;
   /** Tombstone docIds accumulated since last flush — written into the next segment. */
   private pendingTombstones = new Set<number>();
 
@@ -219,6 +223,8 @@ export class SegmentManager {
       throw new ManifestCorruptionError(String(err));
     }
 
+    this._manifestLoaded = true;
+    this._persistedTokenizerKind = manifest.tokenizer.kind;
     this.generation = manifest.generation;
     this.manifestSegments = manifest.segments;
     this.totalDocs = manifest.totalDocs;
@@ -561,4 +567,8 @@ export class SegmentManager {
 
   get indexTotalDocs(): number { return this.totalDocs; }
   get indexTotalLen(): number { return this.totalLen; }
+  /** The tokenizer kind as recorded in the persisted manifest (null for fresh index). */
+  get persistedTokenizerKind(): string | null { return this._persistedTokenizerKind; }
+  /** True when an existing manifest was loaded (not a fresh index). */
+  get manifestLoaded(): boolean { return this._manifestLoaded; }
 }

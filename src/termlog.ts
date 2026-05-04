@@ -24,6 +24,13 @@ export class MappingCorruptionError extends Error {
   }
 }
 
+export class TokenizerMismatchError extends Error {
+  constructor(persisted: string, runtime: string) {
+    super(`Tokenizer mismatch: index was built with "${persisted}" but opened with "${runtime}"`);
+    this.name = "TokenizerMismatchError";
+  }
+}
+
 export interface TermLogOptions {
   dir: string;
   backend?: StorageBackend;
@@ -71,7 +78,16 @@ export class TermLog {
       dir: opts.dir,
       flushThreshold: opts.flushThreshold,
       mergeThreshold: opts.mergeThreshold,
+      tokenizer: { kind: tokenizer.kind, minLen: 1 },
     });
+
+    // When reopening an existing index, validate that the persisted tokenizer kind
+    // matches the runtime tokenizer. Fresh indexes have no manifest to check against.
+    const persisted = mgr.persistedTokenizerKind;
+    if (persisted !== null && persisted !== tokenizer.kind) {
+      await mgr.close();
+      throw new TokenizerMismatchError(persisted, tokenizer.kind);
+    }
 
     const tl = new TermLog(mgr, tokenizer, backend, opts.k1 ?? 1.2, opts.b ?? 0.75);
     await tl.loadDocIds();
