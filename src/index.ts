@@ -1,16 +1,28 @@
-// @backloghq/termlog — log-structured full-text search index.
-// Segment-based posting lists, LSM compaction, BM25 ranking. Pure TypeScript.
-//
-// Public API (incremental — see DESIGN.md and the backlog tasks for the
-// build-out plan):
-//
-//   import { TermLog } from "@backloghq/termlog";
-//
-//   const idx = new TermLog({ dir: "./term-data" });
-//   await idx.open();
-//   await idx.add("doc1", "the quick brown fox");
-//   const hits = await idx.search("fox");      // BM25-ranked
-//   await idx.compact();                       // merge segments
-//   await idx.close();
+export const VERSION = "0.1.0";
 
-export const VERSION = "0.0.1";
+// Storage
+export type { StorageBackend } from "./storage.js";
+export { FsBackend } from "./storage.js";
+
+// Codec
+export type { Posting } from "./codec.js";
+export { encodePostings, decodePostings, postingIterator, encodeVByte, decodeVByte } from "./codec.js";
+
+// Term dictionary
+export type { DictEntry } from "./term-dict.js";
+export { TermDict } from "./term-dict.js";
+
+// Segment
+export { SegmentWriter, SegmentReader, SegmentCorruptionError } from "./segment.js";
+
+// Manager
+export type { ManifestSegmentEntry, TokenizerConfig, SegmentManagerOpts } from "./manager.js";
+export { SegmentManager, ManifestCorruptionError } from "./manager.js";
+
+// Query
+export type { QueryPosting } from "./query.js";
+export { SegmentPostingIter, MultiSegmentIter, andQuery, orQuery } from "./query.js";
+
+// Scoring
+export type { BM25Opts, ScoredDoc } from "./scoring.js";
+export { bm25Score, BM25Ranker } from "./scoring.js";

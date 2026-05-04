@@ -79,7 +79,6 @@ export class SegmentWriter {
    */
   async flush(id: string, backend: StorageBackend): Promise<string> {
     const segPath = `${id}.seg`;
-    const tmpPath = `${id}.seg.tmp`;
 
     // --- Postings region ---
     const postingBuffers: Buffer[] = [];
@@ -141,13 +140,9 @@ export class SegmentWriter {
 
     const segData = Buffer.concat([postingsRegion, sidecarBuf, dictBuf, footer]);
 
-    // Atomic write: write to .tmp, then rename (via backend)
-    await backend.writeBlob(tmpPath, segData);
-    // The backend's writeBlob already does atomic rename internally (tmp→dest).
-    // But we need the final name to be .seg not .seg.tmp, so we rename manually.
-    // Re-use writeBlob for the final file to stay within the backend API.
+    // FsBackend.writeBlob is already atomic (nonce-tmp → rename), so writing
+    // directly to segPath is sufficient. No intermediate .seg.tmp needed.
     await backend.writeBlob(segPath, segData);
-    await backend.deleteBlob(tmpPath);
 
     return segPath;
   }
