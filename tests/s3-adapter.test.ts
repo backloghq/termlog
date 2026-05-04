@@ -15,6 +15,7 @@ import type {
 } from "../src/s3-adapter.js";
 import type { StorageBackend } from "../src/storage.js";
 import { WriteStreamError } from "../src/storage.js";
+import { WriteStreamError as PublicWriteStreamError } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
 // Minimal in-memory mock S3 client
@@ -463,6 +464,7 @@ describe("S3StorageAdapter — createWriteStream multipart", () => {
 
     const err = await adapter.createWriteStream("obj.seg").catch((e) => e);
     expect(err).toBeInstanceOf(WriteStreamError);
+    expect(err).toBeInstanceOf(PublicWriteStreamError);
     expect(err.message).toMatch(/requires CreateMultipartUploadCommand/);
   });
 });

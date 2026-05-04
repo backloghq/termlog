@@ -114,24 +114,11 @@ export class TermDict {
 
   /**
    * Build a TermDict from entries that are already in sorted order.
-   * Cheaper than fromMap() — no spread, sort, or re-map allocation.
+   * Cheaper than building via add() calls — no intermediate allocation.
    */
   static fromSortedEntries(entries: DictEntry[]): TermDict {
     const dict = new TermDict();
     dict.entries = entries;
-    return dict;
-  }
-
-  /**
-   * Build a sorted TermDict from an unsorted map of term → entry data.
-   * Used by the segment writer which accumulates postings in insertion order.
-   */
-  static fromMap(map: Map<string, { postingsOffset: number; postingsLength: number; df: number }>): TermDict {
-    const dict = new TermDict();
-    const sorted = [...map.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    for (const [term, data] of sorted) {
-      dict.add({ term, ...data });
-    }
     return dict;
   }
 }

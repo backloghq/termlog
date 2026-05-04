@@ -133,24 +133,3 @@ describe("TermDict — serialize / deserialize round-trip", () => {
     }
   });
 });
-
-describe("TermDict.fromMap", () => {
-  it("sorts entries by term and builds a searchable dict", () => {
-    const map = new Map([
-      ["zebra",  { postingsOffset: 100, postingsLength: 10, df: 1 }],
-      ["apple",  { postingsOffset: 0,   postingsLength: 20, df: 5 }],
-      ["mango",  { postingsOffset: 50,  postingsLength: 15, df: 3 }],
-    ]);
-    const dict = TermDict.fromMap(map);
-    expect(dict.size).toBe(3);
-
-    // All lookups work
-    expect(dict.lookup("apple")?.df).toBe(5);
-    expect(dict.lookup("mango")?.df).toBe(3);
-    expect(dict.lookup("zebra")?.df).toBe(1);
-
-    // Iteration is sorted
-    const terms = [...dict].map((e) => e.term);
-    expect(terms).toEqual(["apple", "mango", "zebra"]);
-  });
-});

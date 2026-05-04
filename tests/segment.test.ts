@@ -245,6 +245,22 @@ describe("SegmentWriter — docIds sorted within term", () => {
     expect(tfs).toEqual([3, 2, 1]);
   });
 
+  it("sidecar handles non-ascending setDocLength input via index-array sort", async () => {
+    const stream = await backend.createWriteStream("seg-nonascending.seg");
+    const w = new SegmentWriter(stream);
+    // Intentionally non-ascending order to exercise the index-array sort path.
+    w.setDocLength(50, 2);
+    w.setDocLength(10, 3);
+    w.setDocLength(100, 1);
+    await w.writeTerm("x", [10, 50, 100], [1, 1, 1]);
+    await w.finish();
+
+    const r = await SegmentReader.open("seg-nonascending.seg", backend);
+    expect(r.docLen(10)).toBe(3);
+    expect(r.docLen(50)).toBe(2);
+    expect(r.docLen(100)).toBe(1);
+  });
+
   it("writeTerm throws RangeError on out-of-order term", async () => {
     const stream = await backend.createWriteStream("seg-ooo.seg");
     const w = new SegmentWriter(stream);

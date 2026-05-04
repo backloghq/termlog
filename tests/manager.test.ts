@@ -169,6 +169,67 @@ describe("SegmentManager — manifest persistence", () => {
   });
 });
 
+describe("manifest-before-reader-open invariant", () => {
+  it("flushLocked: SegmentReader.open() throwing leaves in-memory state unchanged", async () => {
+    const mgr = await SegmentManager.open({ backend });
+    await mgr.add(0, [{ term: "a", tf: 1 }]);
+    await mgr.add(1, [{ term: "b", tf: 1 }]);
+
+    const preTotalDocs = mgr.indexTotalDocs;
+    const preGen = mgr.commitGeneration();
+    const preSegs = mgr.segments().length;
+
+    // Force SegmentReader.open() to throw by making readBlob fail for .seg files.
+    const realRead = backend.readBlob.bind(backend);
+    backend.readBlob = async (path: string) => {
+      if (path.endsWith(".seg")) throw new Error("simulated read failure");
+      return realRead(path);
+    };
+
+    await expect(mgr.flush()).rejects.toThrow("simulated read failure");
+
+    // Manifest must not have been committed — state unchanged.
+    expect(mgr.indexTotalDocs).toBe(preTotalDocs);
+    expect(mgr.commitGeneration()).toBe(preGen);
+    expect(mgr.segments().length).toBe(preSegs);
+  });
+
+  it("tieredCompactLocked: SegmentReader.open() throwing does not commit merged state", async () => {
+    // Use flushThreshold=1 so each add() immediately flushes a segment.
+    const mgr = await SegmentManager.open({ backend, flushThreshold: 1, fanout: 4 });
+    // Add 3 docs → 3 segments (no cascade yet at fanout=4).
+    for (let i = 0; i < 3; i++) {
+      await mgr.add(i, [{ term: `t${i}`, tf: 1 }]);
+    }
+    // 3 segments, gen=3.
+
+    // The 4th add: flushLocked opens the new segment (segRead #1) and commits a
+    // manifest (gen→4, 4 segments). Then cascadeCompactLocked fires, writes the
+    // merged segment, and tries to open it (segRead #2). We throw there to simulate
+    // SegmentReader.open() failure mid-tieredCompact.
+    // Expected post-throw state: the flush's changes are committed (gen=4, 4 segments),
+    // but tieredCompact's manifest write never happened — so the reader snapshot still
+    // holds the 4 individual segments, not the merged one.
+    let segReadCount = 0;
+    const realRead = backend.readBlob.bind(backend);
+    backend.readBlob = async (path: string) => {
+      if (path.endsWith(".seg")) {
+        segReadCount++;
+        if (segReadCount === 2) throw new Error("simulated merged-reader open failure");
+      }
+      return realRead(path);
+    };
+
+    await expect(mgr.add(3, [{ term: "t3", tf: 1 }])).rejects.toThrow("simulated merged-reader open failure");
+
+    // tieredCompact's manifest was NOT committed — segment count is 4 (not 1 merged),
+    // and generation advanced only once (from the flush), not twice.
+    expect(mgr.segments().length).toBe(4);
+    expect(mgr.commitGeneration()).toBe(4); // 3 prior flushes + 1 flush for doc 3
+    expect(mgr.indexTotalDocs).toBe(4);    // all 4 docs present
+  });
+});
+
 describe("SegmentManager — multiple docs per segment", () => {
   it("packs many docs into one segment correctly", async () => {
     const mgr = await SegmentManager.open({ backend });
