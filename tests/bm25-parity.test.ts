@@ -1,6 +1,12 @@
 /**
- * BM25 parity tests — termlog scores must match agentdb's TextIndex.searchScored
- * to 10 decimal places on a shared 50-doc fixture corpus.
+ * BM25 parity tests — termlog BM25Ranker scores must match a reference
+ * implementation of the same formula on a shared 50-doc fixture corpus.
+ *
+ * Reference is hand-coded here (no agentdb import) using the identical formula:
+ *   idf  = log((N - df + 0.5) / (df + 0.5) + 1)
+ *   norm = k1 * (1 - b + b * (dl / avgdl))
+ *   term = idf * tf * (k1 + 1) / (tf + norm)
+ *   doc  = Σ term  (OR semantics)
  */
 import { describe, it, expect, afterEach, beforeAll } from "vitest";
 import { mkdtemp } from "node:fs/promises";
@@ -9,14 +15,11 @@ import { join } from "node:path";
 import { SegmentWriter, SegmentReader } from "../src/segment.js";
 import { FsBackend } from "../src/storage.js";
 import { bm25Score, BM25Ranker } from "../src/scoring.js";
-// Import agentdb's TextIndex directly from its dist (it's not re-exported publicly).
-import { TextIndex } from "../../agentdb/dist/text-index.js";
 
 // ---------------------------------------------------------------------------
 // Shared 50-doc fixture corpus
 // ---------------------------------------------------------------------------
 
-/** Minimal tokenizer matching agentdb's tokenize() function. */
 function tokenize(text: string): string[] {
   return text.toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu)?.filter((t) => t.length > 0) ?? [];
 }
@@ -93,13 +96,71 @@ const QUERIES = [
 ];
 
 // ---------------------------------------------------------------------------
-// Test setup: build termlog segment + agentdb TextIndex from same corpus
+// Reference BM25 implementation (hand-coded, no external deps)
+// ---------------------------------------------------------------------------
+
+interface RefDoc {
+  id: number;
+  tokens: string[];
+  tfMap: Map<string, number>;
+}
+
+function buildReference(k1: number, b: number) {
+  const docs: RefDoc[] = CORPUS.map((doc) => {
+    const tokens = tokenize(doc.text);
+    const tfMap = new Map<string, number>();
+    for (const t of tokens) tfMap.set(t, (tfMap.get(t) ?? 0) + 1);
+    return { id: doc.id, tokens, tfMap };
+  });
+
+  const N = docs.length;
+  const totalLen = docs.reduce((s, d) => s + d.tokens.length, 0);
+  const avgdl = totalLen / N;
+
+  // Build df map
+  const dfMap = new Map<string, number>();
+  for (const doc of docs) {
+    for (const term of doc.tfMap.keys()) {
+      dfMap.set(term, (dfMap.get(term) ?? 0) + 1);
+    }
+  }
+
+  function searchScored(query: string, limit: number): Array<{ id: number; score: number }> {
+    const terms = tokenize(query);
+    if (terms.length === 0) return [];
+
+    const scores = new Map<number, number>();
+    for (const doc of docs) {
+      let docScore = 0;
+      for (const term of new Set(terms)) {
+        const tf = doc.tfMap.get(term) ?? 0;
+        if (tf === 0) continue;
+        const df = dfMap.get(term) ?? 0;
+        const dl = doc.tokens.length;
+        docScore += bm25Score(tf, dl, df, N, k1, b, avgdl);
+      }
+      if (docScore > 0) scores.set(doc.id, docScore);
+    }
+
+    const results = Array.from(scores.entries()).map(([id, score]) => ({ id, score }));
+    results.sort((a, z) => {
+      if (z.score !== a.score) return z.score - a.score;
+      const sa = String(a.id); const sz = String(z.id);
+      return sa < sz ? -1 : sa > sz ? 1 : 0;
+    });
+    return results.slice(0, limit);
+  }
+
+  return { docs, N, totalLen, searchScored };
+}
+
+// ---------------------------------------------------------------------------
+// Test setup: build termlog segment from same corpus
 // ---------------------------------------------------------------------------
 
 let dir: string;
 let backend: FsBackend;
 let seg: SegmentReader;
-let textIndex: InstanceType<typeof TextIndex>;
 let N: number;
 let totalLen: number;
 
@@ -108,7 +169,6 @@ beforeAll(async () => {
   backend = new FsBackend(dir);
 
   const writer = new SegmentWriter();
-  textIndex = new TextIndex({ k1: 1.2, b: 0.75 });
   totalLen = 0;
 
   for (const doc of CORPUS) {
@@ -118,10 +178,6 @@ beforeAll(async () => {
     for (const [term, tf] of tfMap) writer.addPosting(term, doc.id, tf);
     writer.setDocLength(doc.id, tokens.length);
     totalLen += tokens.length;
-
-    // Feed identical data to agentdb TextIndex.
-    const record: Record<string, unknown> = { text: doc.text };
-    textIndex.add(String(doc.id), record);
   }
 
   await writer.flush("seg-parity", backend);
@@ -141,10 +197,9 @@ describe("bm25Score — pure function", () => {
   });
 
   it("very common term (df=N) produces a small but positive idf", () => {
-    // idf = log((N-df+0.5)/(df+0.5)+1) = log(0.5/100.5+1) > 0 (not zero)
     const score = bm25Score(1, 10, 100, 100, 1.2, 0.75, 10);
     expect(score).toBeGreaterThan(0);
-    expect(score).toBeLessThan(0.01); // idf is very small ≈ 0.005
+    expect(score).toBeLessThan(0.01);
   });
 
   it("avgdl=0 falls back to 1 (no NaN)", () => {
@@ -154,7 +209,6 @@ describe("bm25Score — pure function", () => {
   });
 
   it("matches manual formula for known inputs", () => {
-    // tf=3, dl=10, df=5, N=100, k1=1.2, b=0.75, avgdl=10
     const idf = Math.log((100 - 5 + 0.5) / (5 + 0.5) + 1);
     const norm = 1.2 * (1 - 0.75 + 0.75 * (10 / 10));
     const expected = idf * (3 * 2.2) / (3 + norm);
@@ -209,8 +263,7 @@ describe("BM25Ranker — edge cases", () => {
     }
   });
 
-  it("ties broken by string-lexicographic docId asc (mirrors agentdb)", () => {
-    // agentdb tie-breaks by string id lex order, so "11" < "2".
+  it("ties broken by string-lexicographic docId asc (mirrors reference)", () => {
     const ranker = new BM25Ranker();
     const results = ranker.score(["fox"], [seg], N, totalLen);
     for (let i = 1; i < results.length; i++) {
@@ -230,148 +283,99 @@ describe("BM25Ranker — edge cases", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Parity tests — termlog vs agentdb TextIndex, to 10 decimal places
+// Parity tests — termlog vs hand-coded reference, to 10 decimal places
 // ---------------------------------------------------------------------------
 
-describe("BM25Ranker — parity vs agentdb TextIndex (k1=1.2, b=0.75)", () => {
+describe("BM25Ranker — parity vs reference (k1=1.2, b=0.75)", () => {
+  const ref = buildReference(1.2, 0.75);
   const ranker = new BM25Ranker({ k1: 1.2, b: 0.75 });
 
   for (const query of QUERIES) {
     it(`query: "${query}"`, () => {
       const queryTerms = tokenize(query);
-
-      // agentdb scores (OR semantics, top-10).
-      const agentdbResults = textIndex.searchScored(query, { limit: 10 });
-
-      // termlog scores (same top-10).
+      const refResults = ref.searchScored(query, 10);
       const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
 
-      expect(termlogResults.length).toBe(agentdbResults.length);
-
-      for (let i = 0; i < agentdbResults.length; i++) {
-        const aRef = agentdbResults[i];
-        const tRef = termlogResults[i];
-        // docIds map: agentdb uses string IDs; termlog uses numeric.
-        expect(tRef.docId).toBe(Number(aRef.id));
-        expect(tRef.score).toBeCloseTo(aRef.score, 10);
+      expect(termlogResults.length).toBe(refResults.length);
+      for (let i = 0; i < refResults.length; i++) {
+        expect(termlogResults[i].docId).toBe(refResults[i].id);
+        expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
       }
     });
   }
 });
 
-// ---------------------------------------------------------------------------
-// Parity tests — k1=0 (pure IDF, no TF saturation)
-// ---------------------------------------------------------------------------
-
-describe("BM25Ranker — parity vs agentdb TextIndex (k1=0, b=0.75)", () => {
-  let k0TextIndex: InstanceType<typeof TextIndex>;
-
-  beforeAll(() => {
-    k0TextIndex = new TextIndex({ k1: 0, b: 0.75 });
-    for (const doc of CORPUS) {
-      k0TextIndex.add(String(doc.id), { text: doc.text });
-    }
-  });
+describe("BM25Ranker — parity vs reference (k1=0, b=0.75)", () => {
+  const ref = buildReference(0, 0.75);
+  const ranker = new BM25Ranker({ k1: 0, b: 0.75 });
 
   it('query: "fox"', () => {
-    const ranker = new BM25Ranker({ k1: 0, b: 0.75 });
-    const queryTerms = tokenize("fox");
-    const agentdbResults = k0TextIndex.searchScored("fox", { limit: 10 });
-    const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
-    expect(termlogResults.length).toBe(agentdbResults.length);
-    for (let i = 0; i < agentdbResults.length; i++) {
-      expect(termlogResults[i].docId).toBe(Number(agentdbResults[i].id));
-      expect(termlogResults[i].score).toBeCloseTo(agentdbResults[i].score, 10);
+    const refResults = ref.searchScored("fox", 10);
+    const termlogResults = ranker.score(tokenize("fox"), [seg], N, totalLen, 10);
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
   });
 
   it('query: "quick brown fox"', () => {
-    const ranker = new BM25Ranker({ k1: 0, b: 0.75 });
-    const queryTerms = tokenize("quick brown fox");
-    const agentdbResults = k0TextIndex.searchScored("quick brown fox", { limit: 10 });
-    const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
-    expect(termlogResults.length).toBe(agentdbResults.length);
-    for (let i = 0; i < agentdbResults.length; i++) {
-      expect(termlogResults[i].docId).toBe(Number(agentdbResults[i].id));
-      expect(termlogResults[i].score).toBeCloseTo(agentdbResults[i].score, 10);
+    const refResults = ref.searchScored("quick brown fox", 10);
+    const termlogResults = ranker.score(tokenize("quick brown fox"), [seg], N, totalLen, 10);
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
   });
 });
 
-// ---------------------------------------------------------------------------
-// Parity tests — b=0 (no length normalization)
-// ---------------------------------------------------------------------------
-
-describe("BM25Ranker — parity vs agentdb TextIndex (k1=1.2, b=0)", () => {
-  let b0TextIndex: InstanceType<typeof TextIndex>;
-
-  beforeAll(() => {
-    b0TextIndex = new TextIndex({ k1: 1.2, b: 0 });
-    for (const doc of CORPUS) {
-      b0TextIndex.add(String(doc.id), { text: doc.text });
-    }
-  });
+describe("BM25Ranker — parity vs reference (k1=1.2, b=0)", () => {
+  const ref = buildReference(1.2, 0);
+  const ranker = new BM25Ranker({ k1: 1.2, b: 0 });
 
   it('query: "fox"', () => {
-    const ranker = new BM25Ranker({ k1: 1.2, b: 0 });
-    const queryTerms = tokenize("fox");
-    const agentdbResults = b0TextIndex.searchScored("fox", { limit: 10 });
-    const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
-    expect(termlogResults.length).toBe(agentdbResults.length);
-    for (let i = 0; i < agentdbResults.length; i++) {
-      expect(termlogResults[i].docId).toBe(Number(agentdbResults[i].id));
-      expect(termlogResults[i].score).toBeCloseTo(agentdbResults[i].score, 10);
+    const refResults = ref.searchScored("fox", 10);
+    const termlogResults = ranker.score(tokenize("fox"), [seg], N, totalLen, 10);
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
   });
 
   it('query: "dog bear"', () => {
-    const ranker = new BM25Ranker({ k1: 1.2, b: 0 });
-    const queryTerms = tokenize("dog bear");
-    const agentdbResults = b0TextIndex.searchScored("dog bear", { limit: 10 });
-    const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
-    expect(termlogResults.length).toBe(agentdbResults.length);
-    for (let i = 0; i < agentdbResults.length; i++) {
-      expect(termlogResults[i].docId).toBe(Number(agentdbResults[i].id));
-      expect(termlogResults[i].score).toBeCloseTo(agentdbResults[i].score, 10);
+    const refResults = ref.searchScored("dog bear", 10);
+    const termlogResults = ranker.score(tokenize("dog bear"), [seg], N, totalLen, 10);
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
   });
 });
 
-// ---------------------------------------------------------------------------
-// Parity tests — b=1 (full length normalization)
-// ---------------------------------------------------------------------------
-
-describe("BM25Ranker — parity vs agentdb TextIndex (k1=1.2, b=1)", () => {
-  let b1TextIndex: InstanceType<typeof TextIndex>;
-
-  beforeAll(() => {
-    b1TextIndex = new TextIndex({ k1: 1.2, b: 1 });
-    for (const doc of CORPUS) {
-      b1TextIndex.add(String(doc.id), { text: doc.text });
-    }
-  });
+describe("BM25Ranker — parity vs reference (k1=1.2, b=1)", () => {
+  const ref = buildReference(1.2, 1);
+  const ranker = new BM25Ranker({ k1: 1.2, b: 1 });
 
   it('query: "quick"', () => {
-    const ranker = new BM25Ranker({ k1: 1.2, b: 1 });
-    const queryTerms = tokenize("quick");
-    const agentdbResults = b1TextIndex.searchScored("quick", { limit: 10 });
-    const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
-    expect(termlogResults.length).toBe(agentdbResults.length);
-    for (let i = 0; i < agentdbResults.length; i++) {
-      expect(termlogResults[i].docId).toBe(Number(agentdbResults[i].id));
-      expect(termlogResults[i].score).toBeCloseTo(agentdbResults[i].score, 10);
+    const refResults = ref.searchScored("quick", 10);
+    const termlogResults = ranker.score(tokenize("quick"), [seg], N, totalLen, 10);
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
   });
 
   it('query: "fox dog bear"', () => {
-    const ranker = new BM25Ranker({ k1: 1.2, b: 1 });
-    const queryTerms = tokenize("fox dog bear");
-    const agentdbResults = b1TextIndex.searchScored("fox dog bear", { limit: 10 });
-    const termlogResults = ranker.score(queryTerms, [seg], N, totalLen, 10);
-    expect(termlogResults.length).toBe(agentdbResults.length);
-    for (let i = 0; i < agentdbResults.length; i++) {
-      expect(termlogResults[i].docId).toBe(Number(agentdbResults[i].id));
-      expect(termlogResults[i].score).toBeCloseTo(agentdbResults[i].score, 10);
+    const refResults = ref.searchScored("fox dog bear", 10);
+    const termlogResults = ranker.score(tokenize("fox dog bear"), [seg], N, totalLen, 10);
+    expect(termlogResults.length).toBe(refResults.length);
+    for (let i = 0; i < refResults.length; i++) {
+      expect(termlogResults[i].docId).toBe(refResults[i].id);
+      expect(termlogResults[i].score).toBeCloseTo(refResults[i].score, 10);
     }
   });
 });
