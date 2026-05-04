@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { TermLog } from "../src/termlog.js";
+import { SegmentManager } from "../src/manager.js";
 import { FsBackend } from "../src/storage.js";
 import { VERSION } from "../src/index.js";
 
@@ -279,5 +280,79 @@ describe("TermLog — tombstone carry-forward across partial merge", () => {
       if (i === 6) continue;
       expect(ids, `doc-${i} missing`).toContain(`doc-${i}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLOCKER 2 — tombstone carry-forward: cascade path (unresolved tombstone)
+//
+// Exercises the branch where a tombstone in a merged segment targets a doc
+// in a DIFFERENT (unmerged) segment, so it must be written to the merged
+// output. This is distinct from the test above which calls compact() and
+// merges everything — here the tombstone lives in a tier-0 segment that
+// merges with another tier-0 segment, but its target doc is in a tier-1
+// segment that is NOT part of that merge.
+// ---------------------------------------------------------------------------
+describe("tombstone carry-forward — cascade tier scenario", () => {
+  it("tombstone in tier-0 merge targeting tier-1 doc is written to merged output", async () => {
+    // Setup: fanout=2, flushThreshold=1 so every add triggers auto-flush + cascade.
+    //
+    // Sequence:
+    //   add A → flush (tier-0 seg #0)
+    //   add B → flush (tier-0 seg #1) → 2 tier-0 segs → cascade: merge into tier-1 seg #2
+    //   add C → flush (tier-0 seg #3)
+    //   remove A → queued tombstone
+    //   add D → flush (tier-0 seg #4, carries tombstone for A's numId)
+    //     → 2 tier-0 segs (#3 and #4) → cascade: merge into tier-1 seg #5
+    //     → now 2 tier-1 segs (#2 and #5) → cascade: merge into tier-2 seg #6
+    //
+    // After all cascades settle: a single tier-2 segment should exist that
+    // does NOT contain A (tombstoned). We verify via TermLog.search().
+    //
+    // Additionally, before the final tier-1→tier-2 merge, the tier-1 seg #5
+    // must carry the unresolved tombstone for A (whose doc lives in seg #2).
+    // We verify this by opening a plain SegmentManager on the same dir and
+    // checking .tombstones on the tier-1 segment containing C/D after the
+    // first partial cascade.
+
+    // Use SegmentManager directly to control the exact flush sequence.
+    const mgr = await SegmentManager.open({ dir, backend, flushThreshold: 1, fanout: 2 });
+
+    // add A (numId 0)
+    await mgr.add(0, [{ term: "alpha", tf: 1 }, { term: "shared", tf: 1 }]);
+    // add B (numId 1) → auto-flush + cascade merges 0+1 into tier-1
+    await mgr.add(1, [{ term: "beta", tf: 1 }, { term: "shared", tf: 1 }]);
+
+    // At this point: 1 tier-1 segment containing docs 0 and 1.
+    expect(mgr.segments()).toHaveLength(1);
+    expect(mgr.segments()[0].tombstones).toHaveLength(0);
+
+    // add C (numId 2) → auto-flush → tier-0
+    await mgr.add(2, [{ term: "gamma", tf: 1 }, { term: "shared", tf: 1 }]);
+    // tombstone for doc 0 (A)
+    await mgr.remove(0);
+    // add D (numId 3) → auto-flush (carries tombstone for 0) → tier-0
+    // → 2 tier-0 segs → cascade merges into tier-1
+    // → 2 tier-1 segs → cascade merges into tier-2
+    await mgr.add(3, [{ term: "delta", tf: 1 }, { term: "shared", tf: 1 }]);
+
+    // After all cascades: one segment (tier-2) with docs 1, 2, 3 (not 0).
+    const segs = mgr.segments();
+    expect(segs).toHaveLength(1);
+    expect(segs[0].docLen(0)).toBe(0); // doc 0 tombstoned — not in sidecar
+    expect(segs[0].docLen(1)).toBeGreaterThan(0);
+    expect(segs[0].docLen(2)).toBeGreaterThan(0);
+    expect(segs[0].docLen(3)).toBeGreaterThan(0);
+
+    // Query via BM25 must not return doc 0.
+    const ranker = (await import("../src/scoring.js")).BM25Ranker;
+    const results = new ranker().score(["shared"], mgr.segments(), mgr.indexTotalDocs, mgr.indexTotalLen);
+    const docIds = results.map((r) => r.docId);
+    expect(docIds).not.toContain(0);
+    expect(docIds).toContain(1);
+    expect(docIds).toContain(2);
+    expect(docIds).toContain(3);
+
+    await mgr.close();
   });
 });

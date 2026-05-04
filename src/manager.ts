@@ -506,10 +506,18 @@ export class SegmentManager {
     // tombstoneUnion contains original numIds; localId IS the original numId
     // because TermLog allocates globally unique numIds and we never renumber.
     const survivingDocs = new Map<number, number>(); // docId → len
+    // Track only the tombstoned docs that appear in the merged set — this is
+    // the minimal partition needed to identify unresolved tombstones without
+    // building a full mergedDocIds Set (which would double memory at large N).
+    const tombstonedMergedDocs = new Set<number>();
+    let mergedTotalLen = 0;
     for (const seg of toMergeReaders) {
       for (const [docId, len] of seg.docLenEntries()) {
-        if (!tombstoneUnion.has(docId)) {
+        if (tombstoneUnion.has(docId)) {
+          tombstonedMergedDocs.add(docId);
+        } else {
           survivingDocs.set(docId, len);
+          mergedTotalLen += len;
         }
       }
     }
@@ -584,12 +592,10 @@ export class SegmentManager {
     }
 
     // Carry forward tombstones that target docs NOT in the merged segments.
-    // These tombstones target docs in unmerged segments and must not be dropped.
-    const mergedDocIds = new Set<number>();
-    for (const seg of toMergeReaders) {
-      for (const [docId] of seg.docLenEntries()) mergedDocIds.add(docId);
-    }
-    const unresolvedTombstones = [...tombstoneUnion].filter((id) => !mergedDocIds.has(id));
+    // A tombstone is unresolved iff its target did NOT appear in any merged segment's sidecar.
+    // tombstonedMergedDocs holds exactly those tombstone targets that were in the merge set,
+    // so the complement (tombstoneUnion minus tombstonedMergedDocs) is the unresolved set.
+    const unresolvedTombstones = [...tombstoneUnion].filter((id) => !tombstonedMergedDocs.has(id));
     if (unresolvedTombstones.length > 0) {
       writer.setTombstones(unresolvedTombstones);
     }
@@ -600,7 +606,7 @@ export class SegmentManager {
     const mergedEntry: ManifestSegmentEntry = {
       id: mergedId,
       docCount: survivingDocs.size,
-      totalLen: [...survivingDocs.values()].reduce((s, l) => s + l, 0),
+      totalLen: mergedTotalLen,
       tier: outputTier,
     };
 
