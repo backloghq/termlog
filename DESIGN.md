@@ -122,7 +122,7 @@ interface StorageBackend {
 
 **Streaming-write crash safety:**
 - `FsBackend`: writes to a unique `<path>.<nonce>.tmp`, fsyncs data, renames over target, fsyncs directory. Concurrent calls use distinct nonces. `abort()` unlinks the tmp file.
-- S3 (`S3Backend` from `@backloghq/termlog-s3`): uses the multipart upload protocol. Parts are buffered in memory until 5 MiB (S3 minimum), then uploaded. `end()` calls `CompleteMultipartUpload`; if Complete fails, `AbortMultipartUpload` is sent automatically before re-throwing. Zero-byte `end()` aborts the upload and falls back to `PutObject` with an empty body. S3 multipart has a maximum object size of 50 GiB — a single segment must fit within this bound. Stale incomplete multipart uploads (crash mid-flush) are not cleaned up by termlog; configure an S3 lifecycle rule to expire incomplete uploads after 1–7 days.
+- S3 (`S3Backend` from `@backloghq/termlog-s3`): uses the multipart upload protocol. Parts are buffered in memory until 5 MiB (S3 minimum), then uploaded. `end()` calls `CompleteMultipartUpload`; if Complete fails, `AbortMultipartUpload` is sent automatically before re-throwing. Zero-byte `end()` aborts the upload and falls back to `PutObject` with an empty body. S3 multipart has a maximum object size of 50 GiB — a single segment must fit within this bound. Stale incomplete multipart uploads (crash mid-flush) are not cleaned up by termlog; configure an S3 lifecycle rule to expire incomplete uploads after 1 day.
 
 `FsBackend` ships with termlog. For S3-backed indexes, use the companion package [@backloghq/termlog-s3](https://github.com/backloghq/termlog-s3).
 

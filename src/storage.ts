@@ -1,6 +1,6 @@
 /**
  * StorageBackend abstraction — pluggable blob storage.
- * FsBackend ships natively; S3StorageAdapter wraps any S3-compatible backend.
+ * FsBackend ships natively; S3 support via @backloghq/termlog-s3 (separate package).
  */
 
 import { readFile, readdir, unlink, rename, open } from "node:fs/promises";
