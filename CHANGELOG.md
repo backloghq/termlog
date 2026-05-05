@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-05
+
+### Changed
+
+- Republish of 0.1.1 with corrected CHANGELOG date in the published tarball (the 0.1.1 tarball shipped with the entry dated 2026-05-04; identical code). 0.1.1 deprecated on npm with a pointer to 0.1.2.
+
 ## [0.1.1] - 2026-05-05
 
 ### Added
