@@ -308,4 +308,23 @@ export class TermLog {
   segmentCount(): number {
     return this.mgr.segments().length;
   }
+
+  /**
+   * Approximate in-memory footprint in bytes.
+   *
+   * Sums:
+   * - SegmentManager: postingsRegion buffers + docLen/tombstone Uint32Arrays +
+   *   TermDict entry objects + write buffer terms + pendingTombstones Set.
+   * - TermLog facade: strToNum and numToStr Maps — estimated at 80 bytes per
+   *   entry (V8 Map node overhead + two small integers or a short string).
+   *
+   * The result is a lower-bound approximation suitable for memory-budget
+   * decisions; it deliberately undercounts V8 object header overhead.
+   */
+  estimatedBytes(): number {
+    // V8 Map entry overhead: ~80 bytes per entry (key slot + value slot + hash
+    // chain pointer + hidden class reference). Each docId appears in both maps.
+    const mapEntryBytes = (this.strToNum.size + this.numToStr.size) * 80;
+    return this.mgr.estimatedBytes() + mapEntryBytes;
+  }
 }

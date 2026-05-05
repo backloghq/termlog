@@ -157,6 +157,8 @@ class TermLog {
   // Stats
   docCount(): number;
   segmentCount(): number;
+  /** Approximate in-memory footprint — postings buffers + sidecar arrays + Maps. Lower-bound estimate. */
+  estimatedBytes(): number;
 }
 
 interface TermLogOptions {

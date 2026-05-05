@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-04
+
+### Added
+
+- `TermLog.estimatedBytes()` — approximate in-memory footprint for memory-budget callers. Sums postings region buffers, doc-length and tombstone `Uint32Array`s, TermDict entry objects, write-buffer term arrays, pending tombstone Set entries, and strToNum/numToStr Map entries.
+
 ## [0.1.0] - 2026-05-05
 
 ### Added

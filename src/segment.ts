@@ -341,6 +341,13 @@ export class SegmentReader {
     return new SegmentReader(postingsRegion, dict, docLenArr, tombstones, footer.docCount, footer.termCount);
   }
 
+  /** Byte length of the postings region buffer held in memory. */
+  get postingsBytes(): number { return this.postingsRegion.byteLength; }
+  /** Byte length of the doc-length sidecar Uint32Array held in memory. */
+  get docLenBytes(): number { return this.docLenArr.byteLength; }
+  /** Byte length of the tombstones Uint32Array held in memory. */
+  get tombstoneBytes(): number { return this.tombstones.byteLength; }
+
   /** Returns true if docId is tombstoned in this segment (binary search). */
   isTombstoned(docId: number): boolean {
     let lo = 0;

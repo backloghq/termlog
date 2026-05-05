@@ -718,4 +718,41 @@ export class SegmentManager {
   get persistedTokenizerMinLen(): number | null { return this._persistedTokenizerMinLen; }
   /** True when an existing manifest was loaded (not a fresh index). */
   get manifestLoaded(): boolean { return this._manifestLoaded; }
+
+  /**
+   * Approximate in-memory footprint of the SegmentManager in bytes.
+   *
+   * Accounts for:
+   * - Each SegmentReader's postingsRegion Buffer + docLenArr Uint32Array +
+   *   tombstones Uint32Array + TermDict entries array (estimated at
+   *   ~(termCount × 80) bytes — one JS object + two numbers + average 8-char term).
+   * - Write buffer: each BufferedDoc holds a terms array; estimated at
+   *   ~(termCount_per_doc × 64) bytes per doc (term string + number pair).
+   * - pendingTombstones Set: ~(size × 40) bytes.
+   *
+   * The formula is intentionally conservative (underestimates V8 object overhead)
+   * so callers treat it as a lower bound, not an exact measurement.
+   */
+  estimatedBytes(): number {
+    let bytes = 0;
+
+    // Flushed segments held in readerSnapshot
+    for (const seg of this.readerSnapshot) {
+      bytes += seg.postingsBytes;
+      bytes += seg.docLenBytes;
+      bytes += seg.tombstoneBytes;
+      // TermDict entries array: one JS object (~48 bytes) + term string + 3 numbers
+      bytes += seg.termCount * 80;
+    }
+
+    // Write buffer (unflushed docs)
+    for (const doc of this.buffer) {
+      bytes += doc.terms.length * 64;
+    }
+
+    // Pending tombstones Set
+    bytes += this.pendingTombstones.size * 40;
+
+    return bytes;
+  }
 }

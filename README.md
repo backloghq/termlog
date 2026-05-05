@@ -84,6 +84,14 @@ See the [termlog-s3 README](https://github.com/backloghq/termlog-s3) for IAM per
 | `IndexLockedError` | another process holds the advisory `.lock` file |
 | `WriteStreamError` | base class for streaming write failures (S3 multipart, etc.) |
 
+## Stats
+
+| Method | Returns | Description |
+|---|---|---|
+| `docCount()` | `number` | Documents indexed across all flushed segments |
+| `segmentCount()` | `number` | Number of active on-disk segments |
+| `estimatedBytes()` | `number` | Approximate in-memory footprint (postings buffers + sidecar arrays + Maps); lower-bound estimate for memory-budget callers |
+
 ## Multi-writer / S3 safety
 
 Termlog is **single-writer per index directory**. On local FS an advisory `.lock` file prevents concurrent opens in the same process group. On S3 (or any shared storage) there is no distributed lock — you must ensure at most one writer per index path.

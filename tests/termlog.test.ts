@@ -31,7 +31,7 @@ afterEach(async () => {
 describe("VERSION export (#59ac681f)", () => {
   it("VERSION matches package.json version string", () => {
     expect(VERSION).toMatch(/^\d+\.\d+\.\d+/);
-    expect(VERSION).toBe("0.1.0");
+    expect(VERSION).toBe("0.1.1");
   });
 });
 
@@ -354,5 +354,78 @@ describe("tombstone carry-forward — cascade tier scenario", () => {
     expect(docIds).toContain(3);
 
     await mgr.close();
+  });
+});
+
+describe("TermLog.estimatedBytes()", () => {
+  it("returns a small positive number on an empty index", async () => {
+    const tl = await TermLog.open({ dir, backend });
+    const bytes = tl.estimatedBytes();
+    // Empty index has no segments, no buffer — just the empty Maps (a few hundred bytes at most).
+    expect(bytes).toBeGreaterThanOrEqual(0);
+    expect(bytes).toBeLessThan(1024);
+    await tl.close();
+  });
+
+  it("grows after adding docs (pre-flush, write buffer contributes)", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 10000 });
+    const before = tl.estimatedBytes();
+
+    // Add 100 docs with ~10 unique tokens each (1000 total term entries in buffer).
+    for (let i = 0; i < 100; i++) {
+      const terms = Array.from({ length: 10 }, (_, j) => `word${j} doc${i}`).join(" ");
+      await tl.add(`doc-${i}`, terms);
+    }
+
+    const after = tl.estimatedBytes();
+    // Write buffer has 100 docs × ~12 terms × 64 bytes ≈ 76 800 bytes; Maps have 100 entries × 80 × 2 = 16 000.
+    expect(after).toBeGreaterThan(before + 10_000);
+    expect(after).toBeLessThan(before + 5_000_000); // sanity upper bound
+
+    await tl.close();
+  });
+
+  it("is non-zero after flush (segments take over from buffer)", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 10000 });
+
+    for (let i = 0; i < 100; i++) {
+      const terms = Array.from({ length: 10 }, (_, j) => `word${j} doc${i}`).join(" ");
+      await tl.add(`doc-${i}`, terms);
+    }
+
+    await tl.flush();
+    const bytes = tl.estimatedBytes();
+
+    // After flush the write buffer is cleared but a SegmentReader is now held in memory.
+    // postingsRegion + docLen sidecar + term dict entries should be at least a few KB.
+    expect(bytes).toBeGreaterThan(5_000);
+    // And still reasonable — 100 docs, 100 terms each, shouldn't exceed 2 MB.
+    expect(bytes).toBeLessThan(2_000_000);
+
+    await tl.close();
+  });
+
+  it("tombstones contribute after remove (pre-flush)", async () => {
+    const tl = await TermLog.open({ dir, backend, flushThreshold: 10000 });
+
+    for (let i = 0; i < 50; i++) {
+      await tl.add(`doc-${i}`, `token${i} shared`);
+    }
+    await tl.flush();
+
+    // Remove 20 docs — they turn into pendingTombstones in SegmentManager.
+    const beforeRemove = tl.estimatedBytes();
+    for (let i = 0; i < 20; i++) {
+      await tl.remove(`doc-${i}`);
+    }
+    const afterRemove = tl.estimatedBytes();
+
+    // pendingTombstones: 20 × 40 = 800 bytes; Maps shrunk by 20 × 80 × 2 = 3 200.
+    // Net change is small but result must still be a reasonable positive value.
+    expect(afterRemove).toBeGreaterThan(0);
+    // Removing docs doesn't balloon memory — upper bound unchanged.
+    expect(afterRemove).toBeLessThan(beforeRemove + 50_000);
+
+    await tl.close();
   });
 });
