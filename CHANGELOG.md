@@ -7,11 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### Removed
-
-- **`S3StorageAdapter`** at `@backloghq/termlog/s3` — extracted to companion package `@backloghq/termlog-s3`. Upgrade: `npm install @backloghq/termlog-s3`, replace `import { S3StorageAdapter } from "@backloghq/termlog/s3"` with `import { S3Backend } from "@backloghq/termlog-s3"`, and drop the `commands` injection (AWS SDK commands are now imported directly inside the adapter).
-
-## [0.1.0] - 2026-05-04
+## [0.1.0] - 2026-05-05
 
 ### Added
 
@@ -20,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - **Term dictionary** — sorted on-disk binary format; `add` (in lex order), `lookup` (binary search, O(log n)), `serialize`/`deserialize`, `fromSortedEntries` (zero-copy for already-sorted entries).
 - **StorageBackend abstraction** — `StorageBackend` interface: `readBlob`, `writeBlob`, `listBlobs`, `deleteBlob`, optional `appendBlob`, `createWriteStream`. `BlobWriteStream` interface (`write`/`end`/`abort`). `WriteStreamError` typed error for missing multipart commands.
 - **FsBackend** — atomic `writeBlob` (unique `.tmp` nonce + fsync data + rename + fsync parent dir); `appendBlob` via `O_APPEND|O_CREAT`; `createWriteStream` with exception-safe `end()` (on fsync/close/rename failure: closes handle, unlinks `.tmp`, sets `done=true`, re-throws); idempotent `deleteBlob`; nested directory creation.
+- **S3 support** — available via the companion package `@backloghq/termlog-s3` (peerDeps on termlog).
 - **SegmentManager + manifest** — write buffer with configurable flush threshold; atomic manifest (`manifest.tmp` → rename); immutable reader snapshots (reads are lock-free); `SegmentReader.open` called before `writeManifest` to prevent in-memory desync on open failure; monotonic `generation` counter; `onBeforeManifest` hook.
 - **Size-tiered compaction** — fanout-based LSM merge (default fanout=4, configurable); `chooseCompactionTargets` picks the lowest tier with `>= fanout` segments and cascades until no tier is eligible; write amplification bounded at `O(N log_{fanout} N)`; original doc IDs preserved through merge (sparse uint32 natively supported); tombstones targeting docs in unmerged segments are carried forward on the merged output; streaming k-way heap merge (`MinHeap<T>`); compaction memory bounded via `tombstonedMergedDocs` intersection (vs full `mergedDocIds` Set) and running `mergedTotalLen` accumulator.
 - **Query execution** — `andQuery` (zigzag merge), `orQuery` (k-way union); `MultiSegmentIter` with `MinHeap<HeapSlot>` (O(1) peek, O(K log K) seek); `buildTombstoneSet`.
