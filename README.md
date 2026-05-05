@@ -2,7 +2,7 @@
 
 Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.
 
-**Status:** v0.1.0. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM tiered compaction, crash recovery, advisory lockfile, reader snapshot isolation, S3 backend.
+**Status:** v0.1.0. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM tiered compaction, crash recovery, advisory lockfile, reader snapshot isolation.
 
 ## Install
 
@@ -38,38 +38,32 @@ Existing FTS engines (Lucene, Tantivy) are great but require native deps or JVM.
 - **Term dictionary** — sorted on disk; binary search for lookup.
 - **Segments** — self-contained immutable files (term dict + postings). New writes create a new segment. Compaction merges N segments into 1.
 - **Query execution** — boolean (AND/OR) via posting iterators (zigzag merge for AND, union scan for OR), BM25 scoring on top.
-- **Storage** — abstracted via `StorageBackend`; local FS by default, S3 via the included `S3StorageAdapter` (`@backloghq/termlog/s3`).
+- **Storage** — abstracted via `StorageBackend`; local FS by default, S3 via [@backloghq/termlog-s3](https://github.com/backloghq/termlog-s3).
 
 ## S3 backend
 
+S3 support is provided by the companion package [@backloghq/termlog-s3](https://github.com/backloghq/termlog-s3):
+
+```bash
+npm install @backloghq/termlog @backloghq/termlog-s3
+```
+
 ```ts
 import { TermLog } from "@backloghq/termlog";
-import { S3StorageAdapter } from "@backloghq/termlog/s3";
-import {
-  S3Client,
-  // Read / list / delete commands (required)
-  GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
-  // Multipart write commands (required for flush and compact)
-  CreateMultipartUploadCommand, UploadPartCommand,
-  CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
-} from "@aws-sdk/client-s3";
+import { S3Backend } from "@backloghq/termlog-s3";
+import { S3Client } from "@aws-sdk/client-s3";
 
 const index = await TermLog.open({
   dir: "my-index",
-  backend: new S3StorageAdapter({
+  backend: new S3Backend({
     client: new S3Client({ region: "us-east-1" }),
-    commands: {
-      // Read / list / delete
-      GetObjectCommand, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command,
-      // Multipart write — required; omitting any of these throws at first flush
-      CreateMultipartUploadCommand, UploadPartCommand,
-      CompleteMultipartUploadCommand, AbortMultipartUploadCommand,
-    },
     bucket: "my-bucket",
-    prefix: "my-index/",  // required — scopes all keys; never use empty prefix on shared bucket
+    prefix: "my-index/",
   }),
 });
 ```
+
+See the [termlog-s3 README](https://github.com/backloghq/termlog-s3) for IAM permissions, lifecycle rules, and MinIO/LocalStack usage.
 
 ## Options
 
@@ -90,15 +84,7 @@ const index = await TermLog.open({
 | `MappingCorruptionError` | docids.snap or docids.log is corrupt |
 | `TokenizerMismatchError` | reopening an index with a different tokenizer config |
 | `IndexLockedError` | another process holds the advisory `.lock` file |
-| `WriteStreamError` | `S3StorageAdapter.createWriteStream` — multipart commands missing from constructor |
-
-## S3 notes
-
-`S3StorageAdapter` has no `appendBlob` — on S3 the `docids.log` journal falls back to a read-GET-PUT cycle on every flush, which is O(log size) in bandwidth. For long-running writers, call `compact()` periodically to collapse the log into a snapshot and reset it to empty.
-
-Segments are written via S3 multipart upload. S3 multipart has a maximum object size of 50 GiB; a single segment must fit within that bound. In practice segments stay well under this limit unless you are merging an exceptionally large corpus into a single segment without intermediate compaction.
-
-Stale `.tmp` multipart uploads (crash during a flush or compact) are not automatically cleaned up by termlog. Enable an S3 lifecycle rule to expire incomplete multipart uploads after 1–7 days to avoid accumulating storage charges.
+| `WriteStreamError` | base class for streaming write failures (S3 multipart, etc.) |
 
 ## Multi-writer / S3 safety
 
