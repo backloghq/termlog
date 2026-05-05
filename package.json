@@ -9,10 +9,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    },
-    "./s3": {
-      "types": "./dist/s3-adapter.d.ts",
-      "import": "./dist/s3-adapter.js"
     }
   },
   "scripts": {
