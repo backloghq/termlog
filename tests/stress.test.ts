@@ -27,10 +27,14 @@ import { BM25Ranker } from "../src/scoring.js";
 
 const IS_STRESS        = process.env["STRESS"] === "1";
 const IS_TIERED_STRESS = process.env["STRESS_TIERED"] === "1";
+// CI runners (GH Actions 2-core) are ~2-3x slower than dev workstations.
+// Tighter bound locally catches micro-regressions; CI bound still catches
+// a ~3x regression while tolerating shared-compute variance.
+const IS_CI            = process.env["CI"] === "true";
 
 const N               = IS_STRESS ? 1_000_000 : 10_000;
 const FLUSH_THRESHOLD = IS_STRESS ? 5_000     : 500;
-const P95_LIMIT_MS    = IS_STRESS ? 500       : 50;
+const P95_LIMIT_MS    = IS_STRESS ? (IS_CI ? 1500 : 500) : 50;
 // 1024 MB cap: vitest worker overhead is ~300 MB; actual cascade peaks at ~374 MB direct-node.
 // Using 1024 gives headroom while still catching regressions.
 const MEM_LIMIT_MB    = IS_STRESS ? 1024      : 200;
