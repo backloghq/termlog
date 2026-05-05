@@ -1,28 +1,28 @@
 # Termlog — Design
 
-A log-structured, segment-based full-text search index. Pure TypeScript. Zero native dependencies. Built to scale past the single-blob limit that constrained AgentDB's v1.4 text index.
+A log-structured, segment-based full-text search index. Pure TypeScript. Zero native dependencies. Built to scale past the single-blob ceiling common in pure-JS FTS implementations.
 
 ## Goals
 
 - 1M+ documents per index without per-file size cliffs.
 - Append-only writes; immutable segments; periodic compaction.
 - Pluggable storage backend (FS by default, S3 via the companion [@backloghq/termlog-s3](https://github.com/backloghq/termlog-s3) package).
-- BM25 ranking parity with the v1.4 reference implementation.
+- Standard BM25 ranking with configurable `k1` and `b`.
 - Crash-safe: a manifest records committed segments; partial writes are recoverable.
 
 ## Non-goals (for v0.1)
 
 - Phrase / proximity / positional queries. (Posting lists don't carry positions; the format reserves a position column for a future release.)
-- Per-language analyzers, stemming, stop-word removal. Tokenization is pluggable; default is the same Unicode tokenizer AgentDB ships.
+- Per-language analyzers, stemming, stop-word removal. Tokenization is pluggable; default is a Unicode tokenizer (NFC normalization, configurable `minLen`).
 - Realtime / sub-second freshness. New writes are visible after segment flush. Configurable flush thresholds.
-- Distributed/multi-writer. Single-writer per index, like opslog.
+- Distributed/multi-writer. Single-writer per index.
 
 ## Data model
 
 A **TermLog** owns:
 
 - A sequence of immutable **Segments** on disk.
-- A **manifest** file recording committed segments (atomic rename, like opslog).
+- A **manifest** file recording committed segments (atomic rename).
 - Optional in-memory write buffer (records before segment flush).
 - Per-index metadata: total doc count, sum of doc lengths (for BM25 avgdl), tokenizer config.
 
@@ -141,7 +141,7 @@ interface StorageBackend {
 - Manifest update is atomic via rename.
 - CRC32 footers detect on-disk corruption; corrupted segments fail loudly on first read.
 
-## Public API (v0.1.0 — shipped)
+## Public API
 
 ```ts
 class TermLog {
@@ -172,7 +172,7 @@ interface TermLogOptions {
 
 ## Test strategy
 
-Each module ships with its own tests; integration tests cover crash recovery, concurrent reads during compaction, and BM25 parity vs AgentDB's reference TextIndex on a known corpus.
+Each module ships with its own tests; integration tests cover crash recovery, concurrent reads during compaction, and BM25 parity vs an independently-derived reference scoring on a known corpus.
 
 A 1M-doc stress test asserts: total disk usage, no single segment exceeds a configurable cap, query latency p95 under N ms.
 

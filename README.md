@@ -2,8 +2,6 @@
 
 Log-structured full-text search index — segment-based posting lists with LSM compaction, BM25 ranking, zero native dependencies.
 
-**Status:** v0.1.0. `TermLog` facade (string docId, tokenization, BM25 search), segment-based posting lists with tombstones, streaming LSM tiered compaction, crash recovery, advisory lockfile, reader snapshot isolation.
-
 ## Install
 
 ```
@@ -30,7 +28,7 @@ await index.close();
 
 ## Why
 
-Existing FTS engines (Lucene, Tantivy) are great but require native deps or JVM. AgentDB's pre-termlog text index serialized to a single JSON blob with a 256 MB / ~25-30K-doc cap. Termlog replaces that with segment-based storage: each write creates a new immutable segment; segments are merged LSM-tree style; the corpus scales without per-file ceilings.
+Existing FTS engines (Lucene, Tantivy) require native deps or a JVM. Most pure-JS alternatives serialize the index to a single in-memory blob — fine for small corpora, but they hit per-file size cliffs in the tens of thousands of documents. Termlog uses immutable on-disk segments with LSM compaction so the corpus scales without those ceilings.
 
 ## Architecture
 
